@@ -17,6 +17,11 @@ services:
       PGID: ${PGID:-1000}
       SPF_MEDIA_ROOT: /plex
       SPF_DEFAULT_SUBTITLE_LANGUAGE: en
+      SPF_CLASSIFIER_URLS: ${SPF_CLASSIFIER_URLS:-}
+      SPF_REMOTE_EXTRACT: ${SPF_REMOTE_EXTRACT:-0}
+      SPF_INTERNAL_BASE_URL: ${SPF_INTERNAL_BASE_URL:-}
+      SPF_INTERNAL_TOKEN: ${SPF_INTERNAL_TOKEN:-}
+      SPF_REMOTE_ENCODE_URL: ${SPF_REMOTE_ENCODE_URL:-}
     volumes:
       - ./data-dev:/data
       # Real media, same container-side paths as production's docker-compose.yml, so
