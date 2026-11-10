@@ -44,15 +44,25 @@ def detector() -> NudeDetector:
         with _load_lock:
             det = _cache.get("det")
             if det is None:
-                # NudeNet 3.4.2 has the providers argument commented out in
-                # NudeDetector.__init__, so an un-requested session silently
-                # lands on CPU even in onnxruntime-gpu builds. Request CUDA
-                # explicitly (falling back to CPU-only if CUDA is unavailable,
-                # e.g. a CPU-only worker box).
+                det = NudeDetector()
+                # NudeNet 3.4.2 accepts a `providers` kwarg but never uses it
+                # (the session-creation line has providers commented out), so
+                # every session silently lands on CPU even in onnxruntime-gpu
+                # builds. Rebuild the session with CUDA requested explicitly;
+                # keep the CPU session on any failure (CPU-only worker box,
+                # driver issue) -- classification still works, just slower.
                 try:
-                    det = NudeDetector(providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                    import os as _os
+                    import onnxruntime as _ort
+                    import nudenet.nudenet as _nn
+                    _model = _os.path.join(_os.path.dirname(_nn.__file__), "320n.onnx")
+                    _sess = _ort.InferenceSession(
+                        _model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+                    )
+                    if "CUDAExecutionProvider" in _sess.get_providers():
+                        det.onnx_session = _sess
                 except Exception:
-                    det = NudeDetector()
+                    pass
                 _cache["det"] = det
     return det
 
