@@ -323,6 +323,9 @@ class JobQueue:
             title.video_path = new_path
             title.has_clean_track = False
             title.clean_track_audio_indices = None
+            title.clean_audio_path = None
+            title.clean_audio_source_fingerprint = None
+            title.source_clean_track_audio_indices = None
             title.replacement_requested_at = None
             title.last_error = None
 
@@ -491,6 +494,7 @@ class JobQueue:
                 job.progress_percent = max(job.progress_percent or 0, 97.0)
                 await session.commit()
 
+            obsolete_audio_cache = None
             try:
                 # No usable sidecar .srt (none, a stale path, or forced-only) --
                 # fall back to a full text track embedded in the video itself
@@ -513,19 +517,65 @@ class JobQueue:
                     raise ProcessingError("No subtitle file associated with this title (no sidecar .srt and no embedded text subtitle track)")
 
                 async with HEAVY_PIPELINE_LOCK:
-                    outcome = await process_video(
+                    # Another queued audio run may have replaced the master
+                    # while we waited. Refresh only output bookkeeping; retain
+                    # this job's already-resolved subtitle/source decisions.
+                    await session.refresh(title, attribute_names=[
+                        'clean_audio_path', 'clean_audio_source_fingerprint',
+                        'source_clean_track_audio_indices', 'clean_track_audio_indices',
+                    ])
+                    from functools import partial
+                    from app.output import source_fingerprint, title_edit_destination
+                    destination = await title_edit_destination(session, title, app_settings.media_root)
+                    source_clean_indices = parse_index_list(
+                        title.source_clean_track_audio_indices if title.clean_audio_path
+                        else title.clean_track_audio_indices)
+                    if (title.clean_audio_path and title.clean_audio_source_fingerprint
+                            != source_fingerprint(Path(title.video_path))):
+                        source_clean_indices = None
+                    processor = process_video
+                    separate_phase = 'Generating clean audio'
+
+                    async def external_stage(message: str) -> None:
+                        nonlocal separate_phase
+                        separate_phase = message
+                        job.progress_message = message
+                        # This is a multi-phase job, not the legacy short
+                        # post-mux tail. Do not force 97% before blur starts.
+                        await session.commit()
+
+                    async def external_progress(fraction: float) -> None:
+                        nonlocal last_update_monotonic
+                        now = time.monotonic()
+                        if fraction < 0.999 and now - last_update_monotonic < _PROGRESS_UPDATE_MIN_INTERVAL_SECONDS:
+                            return
+                        last_update_monotonic = now
+                        job.progress_percent = round(mux_base_percent + fraction * mux_percent_span, 1)
+                        job.progress_message = f'{separate_phase} -- {round(fraction * 100)}%'
+                        await session.commit()
+
+                    if destination is not None:
+                        from app.external_edits import process_external_video
+                        processor = partial(process_external_video, title=title,
+                                            job_id=job.id, destination=destination)
+                    outcome = await processor(
                         session,
                         title_id=title.id,
                         video_path=Path(title.video_path),
                         subtitle_path=Path(title.subtitle_path),
                         severity_levels=parse_severity_levels(title.severity_levels),
-                        known_clean_indices=parse_index_list(title.clean_track_audio_indices),
+                        known_clean_indices=source_clean_indices,
                         precise_mode=title.precise_mode,
-                        on_progress=on_progress,
-                        on_stage=on_stage,
+                        on_progress=external_progress if destination is not None else on_progress,
+                        on_stage=external_stage if destination is not None else on_stage,
                         on_align_progress=on_align_progress,
                         on_speech_progress=on_speech_progress,
                     )
+                    if destination is None and title.clean_audio_path:
+                        obsolete_audio_cache = Path(title.clean_audio_path)
+                        title.clean_audio_path = None
+                        title.clean_audio_source_fingerprint = None
+                        title.source_clean_track_audio_indices = None
 
                 job.state = JobState.done
                 job.progress_message = f"Done -- muted {outcome.matched_cue_count} cue(s)"
@@ -558,6 +608,11 @@ class JobQueue:
                 title.status = "failed"
 
             await session.commit()
+            if job.state == JobState.done and obsolete_audio_cache is not None:
+                try:
+                    await asyncio.to_thread(obsolete_audio_cache.unlink, missing_ok=True)
+                except OSError:
+                    logger.warning('Could not remove superseded clean audio cache: %s', obsolete_audio_cache)
 
 
 job_queue = JobQueue()

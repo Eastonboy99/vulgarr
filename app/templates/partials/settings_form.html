@@ -1,4 +1,5 @@
 <form id="settings-form" hx-post="/settings" hx-target="#settings-form" hx-swap="outerHTML" novalidate>
+  {% if output_folder_error %}<p role="alert" class="muted" style="color: var(--vulgarr-outdated-text);">{{ output_folder_error }}</p>{% endif %}
   <p>
     <button type="button" id="advanced-toggle-btn" class="secondary small" onclick="toggleAdvancedSettings()">Show advanced settings</button>
   </p>
@@ -132,6 +133,16 @@
   </div>
 
   <div class="wizard-step" data-step="4">
+  <h2 style="margin-top: 1.75rem;">Edited Video Output</h2>
+  <p class="muted">Optional separate Plex libraries. When a folder is set, both audio and scene edits are written there, leaving the source video untouched. Movies and TV can be configured independently; blank preserves the existing behavior for that type.</p>
+  <div class="settings-grid">
+    <label for="movie_output_folder">Movie output folder</label>
+    <input type="text" id="movie_output_folder" name="movie_output_folder" value="{{ values.movie_output_folder or '' }}" placeholder="/edits/movies" class="wide-input">
+    <label for="tv_output_folder">TV output folder</label>
+    <input type="text" id="tv_output_folder" name="tv_output_folder" value="{{ values.tv_output_folder or '' }}" placeholder="/edits/tv" class="wide-input">
+  </div>
+  <p class="muted">Use absolute paths inside the container and add writable Docker mounts for them. The source folder tree relative to SPF_MEDIA_ROOT is mirrored underneath each destination, with a “ - Vulgarr Edit” filename suffix. Additional mounts outside SPF_MEDIA_ROOT use an _external subtree. Existing edits are not moved or deleted when settings change; reprocess to create an edit at the new destination.</p>
+  <p class="muted">Separate-output audio processing retains an audio-only master in a hidden .vulgarr folder beside the edited video so future scene edits preserve profanity filtering and can undo previously approved scene mutes. Allow disk space for that cache as well as the edited video.</p>
   <h2 style="margin-top: 1.75rem;">Video Processing</h2>
   <p class="muted" style="margin-top: -0.5rem;">Detects candidate explicit-content scenes via a local frame classifier. Never runs automatically on import, unlike Audio Processing above -- only ever starts from an explicit "Scan for scenes" click, since a scan has a real CPU cost and Apply produces a full second encoded "Vulgarr Edit" copy of the movie/episode.</p>
   <div class="settings-grid">

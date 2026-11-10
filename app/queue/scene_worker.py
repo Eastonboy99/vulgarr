@@ -442,6 +442,13 @@ class SceneJobQueue:
                     )
                 else:
                     async with HEAVY_PIPELINE_LOCK:
+                        # An audio job can install a new clean master while
+                        # this job waits for the gate. Its pre-wait identity-map
+                        # snapshot must not reference the now-retired cache.
+                        await session.refresh(title, attribute_names=[
+                            'clean_audio_path', 'clean_audio_source_fingerprint',
+                            'source_clean_track_audio_indices',
+                        ])
                         blur_outcome = await apply_scene_blur(
                             session, title, job.id, on_progress=on_blur_progress, on_stage=on_blur_stage
                         )

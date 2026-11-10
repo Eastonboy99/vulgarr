@@ -41,7 +41,7 @@ class RemuxError(RuntimeError):
 @dataclass(frozen=True)
 class RemuxResult:
     output_path: Path
-    backup_path: Path
+    backup_path: Path | None
     matched_cue_count: int
     clean_track_indices: list[int]  # 0-based audio-stream indices of the new tracks, in canonical order
 
@@ -139,7 +139,13 @@ async def probe(ffprobe_bin: str, path: Path) -> dict:
 
 
 def _audio_streams(probe_data: dict) -> list[dict]:
-    return [s for s in probe_data["streams"] if s["codec_type"] == "audio"]
+    # Separate-library audio masters append one tiny, tagged silent stream at
+    # t=0 to anchor the container timeline when real audio starts late. It is
+    # always last, so all real audio-relative indices remain unchanged, and
+    # must never be mapped into a published edit or counted for verification.
+    return [s for s in probe_data['streams'] if s['codec_type'] == 'audio'
+            and str(s.get('tags', {}).get('VULGARR_TIMING_ANCHOR',
+                    s.get('tags', {}).get('vulgarr_timing_anchor', ''))) != '1']
 
 
 @dataclass(frozen=True)
@@ -226,6 +232,7 @@ async def build_clean_track(
     audio_bitrate: str = "192k",
     timeout: float = 3600,
     on_progress: ProgressCallback | None = None,
+    staging_dir: Path | None = None,
 ) -> Path:
     """Run ffmpeg to produce a temp file with all original streams copied plus one new
     muted track per (severity, intervals) pair, all generated in a single pass."""
@@ -281,6 +288,9 @@ async def build_clean_track(
     # same title (a double-click, or a webhook firing while a manual job is
     # already running) would otherwise share this exact path and race on it.
     tmp_path = video_path.with_name(f".{video_path.stem}.spf-tmp.{uuid.uuid4().hex[:8]}{video_path.suffix}")
+    if staging_dir is not None:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = staging_dir / tmp_path.name
 
     cmd = [
         ffmpeg_bin,
@@ -395,9 +405,19 @@ async def remux_with_clean_track(
     keep_backup: bool = True,
     on_progress: ProgressCallback | None = None,
     on_stage: StageCallback | None = None,
+    output_path: Path | None = None,
 ) -> RemuxResult:
+    """Create and verify clean tracks, then publish them using the selected policy.
+
+    Without output_path, retain the original backup-and-swap discipline.
+    With it, stage on the destination filesystem and leave the source intact;
+    backup_path is then None because nothing was removed or overwritten there.
+    Both policies use the same stream plan and output verification.
+    """
     if not video_path.exists():
         raise RemuxError(f"Video file does not exist: {video_path}")
+    if output_path is not None and output_path.resolve() == video_path.resolve():
+        raise RemuxError('Separate output must not overwrite the source video')
     await asyncio.to_thread(remove_orphaned_temp_files, video_path)
 
     src_probe = await probe(ffprobe_bin, video_path)
@@ -415,6 +435,7 @@ async def remux_with_clean_track(
         clean_track_title=clean_track_title,
         clean_track_language=clean_track_language,
         on_progress=on_progress,
+        **({'staging_dir': output_path.parent} if output_path is not None else {}),
     )
 
     # BaseException, not Exception: a cancellation landing here (cancel_job, or
@@ -434,6 +455,22 @@ async def remux_with_clean_track(
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+    if output_path is not None:
+        # Verification is identical, but a separate-library edit must never
+        # enter the backup/swap path below: that path removes the original.
+        # publish_file stages on the destination filesystem before renaming,
+        # since a configured library is commonly on another mount.
+        from app.output import publish_file
+        try:
+            if on_stage is not None:
+                await on_stage('Publishing audio-cleaned edit')
+            await publish_file(tmp_path, output_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        return RemuxResult(output_path=output_path, backup_path=None,
+                           matched_cue_count=len(matches), clean_track_indices=plan.new_track_output_indices)
 
     if on_stage is not None:
         await on_stage("Backing up original and swapping in the clean version")

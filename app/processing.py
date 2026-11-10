@@ -84,7 +84,7 @@ def effective_severity_levels(video_path: str, severity_levels: list[Severity] |
 @dataclass(frozen=True)
 class ProcessingOutcome:
     matched_cue_count: int  # for the most inclusive (lowest-rank) selected level
-    backup_path: Path
+    backup_path: Path | None
     clean_track_indices: list[int]
 
 
@@ -127,8 +127,11 @@ async def process_video(
     on_stage: StageCallback | None = None,
     on_align_progress: AlignProgressCallback | None = None,
     on_speech_progress: SpeechProgressCallback | None = None,
+    output_path: Path | None = None,
 ) -> ProcessingOutcome:
     """Run the full pipeline for one file, generating one clean track per severity level.
+    output_path optionally writes a separate verified edit instead of replacing
+    the source. Alignment, matching and cached speech still read the original.
     Raises ProcessingError/RemuxError on failure."""
     if not subtitle_path.exists():
         raise ProcessingError(f"Subtitle file not found: {subtitle_path}")
@@ -241,6 +244,7 @@ async def process_video(
         ffprobe_bin=app_settings.ffprobe_bin,
         clean_track_title=clean_track_title,
         clean_track_language=clean_track_language,
+        **({'output_path': output_path} if output_path is not None else {}),
         known_clean_indices=known_clean_indices,
         keep_backup=backups_enabled,
         on_progress=on_progress,

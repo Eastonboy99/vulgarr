@@ -89,6 +89,77 @@ cost and Apply produces a full second encoded copy of the file):
    Apply after approving/rejecting more scenes always rebuilds from whatever's
    currently approved.
 
+## Separate libraries for edited videos
+
+In **Settings → Edited Video Output**, set **Movie output folder** and/or
+**TV output folder**. They are independent absolute paths **inside Vulgarr's
+container**, not host paths. A blank setting keeps the existing behavior for
+that media type: audio processing updates the source with a backup/swap;
+scene Apply creates a sibling ` - Vulgarr Edit` file.
+
+When configured, **both audio and scene edits leave the source video as-is**
+and publish the edited copy into that type's destination. This does not undo
+in-place edits performed before the setting was enabled. Paths are mirrored
+relative to `SPF_MEDIA_ROOT`, retaining movie/show/season folders and adding
+` - Vulgarr Edit` to the filename. For example, with `SPF_MEDIA_ROOT=/media`:
+
+| Source | Output setting | Edited video |
+| --- | --- | --- |
+| `/media/Movies/Film (2024)/Film.mkv` | `/edits/movies` | `/edits/movies/Movies/Film (2024)/Film - Vulgarr Edit.mkv` |
+| `/media/TV/Show/Season 01/Show - S01E01.mkv` | `/edits/tv` | `/edits/tv/TV/Show/Season 01/Show - S01E01 - Vulgarr Edit.mkv` |
+
+Point Plex at the **mirrored movie/TV subtree**, e.g. `Movies` or `TV` in those
+examples, using the path visible to Plex. Sources on additional mounts outside
+`SPF_MEDIA_ROOT` go under `_external/<absolute source hierarchy>` rather than
+being flattened into colliding basenames. Changing or clearing a setting never
+moves/deletes previous edits; process again or Apply to publish at the newly
+selected location. Embedded streams/metadata are retained; external subtitle,
+poster and metadata sidecar files are not copied.
+
+Add writable destination mounts to your deployed fork's compose service, e.g.:
+
+```yaml
+services:
+  vulgarr:
+    volumes:
+      - /srv/vulgarr-movies:/edits/movies
+      - /srv/vulgarr-tv:/edits/tv
+```
+
+Mount those same host directories into Plex as needed. Vulgarr creates missing
+subdirectories at processing time; its configured PUID/PGID needs write access.
+A destination/write/copy error fails the job without silently editing the
+original instead. Cross-filesystem publication copies into a hidden temporary
+file on the destination, then renames it, so an incomplete copy never replaces
+a previous successful edit.
+
+### Combining audio and scene edits
+
+Separate-output audio processing retains an **audio-only master** under
+`<edited-video-folder>/.vulgarr/clean_audio/<title-id>/`, containing original
+audio plus the clean tracks. One tiny, tagged silent timing track anchors zero
+when real audio starts late; it is never included in the edited video. These
+hidden `.mka` files stay on the selected output filesystem rather than filling
+the application-data volume. Allow space for them alongside the edited videos. Scene Apply always rebuilds
+from the original video and this master—not from previously blurred video or
+previously scene-muted audio. Reprocessing audio also regenerates currently
+approved scenes before publishing, so it does not erase the blur. Later scene
+rejects/adjustments can therefore remove old blur/mute windows without losing
+profanity filtering or accumulating video re-encodes. A changed source or missing
+master requires reprocessing audio before another scene Apply.
+
+Superseded masters are removed after successful processing; abandoned temporary
+outputs and unreferenced masters are cleaned on the next audio run for that
+title. Do not manually remove the active master if you want future scene edits
+to preserve cleaned audio. Blank output settings ignore the separate-output
+cache and return to the legacy source-based workflow.
+
+The automated tests cover settings, migrations, source preservation, stream
+mapping, combined-job failure, repeated processing and atomic publication with
+mocked ffmpeg. Validate one audio-only and one combined audio/scene edit on real
+media after deployment, including audio sync on delayed-audio sources,
+re-running audio and changing scene approvals.
+
 ## Remote GPU workers (this fork)
 
 See [remote_worker/README.md](remote_worker/README.md) for batch inference,

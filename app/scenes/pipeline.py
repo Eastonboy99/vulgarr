@@ -378,15 +378,22 @@ async def scan_for_scenes(
 async def apply_scene_blur(
     session: AsyncSession,
     title: Title,
-    job_id: int,
+    job_id: int | str,
     on_progress: ProgressCallback | None = None,
     on_stage: StageCallback | None = None,
+    output_path: Path | None = None,
+    commit: bool = True,
+    audio_source_path: Path | None = None,
 ) -> BlurOutcome:
-    """Rebuild the "Vulgarr Edit" sibling file from scratch, blurring+muting
+    """Rebuild the "Vulgarr Edit" file from scratch, blurring+muting
     every currently-approved scene on this title -- not just newly-approved
     ones. The source file is never opened for writing -- a failed blur just
     means the temp file gets deleted, nothing about the original changes, and
     any previously-generated "Vulgarr Edit" file is left in place untouched.
+    A configured output root selects a mirrored destination. When an audio
+    master exists, reuse its clean tracks, never previously scene-muted audio.
+    output_path pins the destination for a combined audio job; commit=False
+    lets that caller commit its cache reference and scene state together.
 
     job_id keys apply_blur's persistent work_dir (app_settings.data_dir /
     "blur_work" / str(job_id)) -- on a container restart, scene_worker's own
@@ -490,8 +497,28 @@ async def apply_scene_blur(
 
         video_progress = _scaled_progress
 
+    from app.output import source_fingerprint, title_edit_destination
+    output_path = output_path or await title_edit_destination(session, title, app_settings.media_root)
+    output_options = {}
+    if output_path is not None:
+        output_options['output_path'] = output_path
+        if audio_source_path is not None:
+            # A combined audio job has validated a new master but must not
+            # put its reference on Title yet: progress callbacks commit this
+            # shared session and would expose pending state before publish.
+            if not audio_source_path.is_file():
+                raise ValueError('New clean audio master is missing')
+            output_options['audio_source_path'] = audio_source_path
+        elif title.clean_audio_path:
+            audio_master = Path(title.clean_audio_path)
+            if (not audio_master.is_file()
+                    or title.clean_audio_source_fingerprint != source_fingerprint(Path(title.video_path))):
+                raise ValueError('Cached clean audio is missing or the source changed. Reprocess audio before applying scenes.')
+            output_options['audio_source_path'] = audio_master
+
     final_path = await apply_blur(
         video_path=Path(title.video_path),
+        **output_options,
         blur_intervals=blur_intervals,
         mute_intervals=mute_intervals,
         ffmpeg_bin=app_settings.ffmpeg_bin,
@@ -526,7 +553,8 @@ async def apply_scene_blur(
     for scene in stale_applied.scalars().all():
         scene.applied_at = None
 
-    await session.commit()
+    if commit:
+        await session.commit()
 
     return BlurOutcome(output_path=final_path, scene_count=len(scenes))
 

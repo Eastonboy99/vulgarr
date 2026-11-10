@@ -1418,18 +1418,24 @@ async def build_blurred_video(
     audio_bitrate: str = "192k",
     timeout: float = 14400,  # ceiling for the final mux step only now, see module docstring
     force_whole_file_video: bool = False,
+    audio_source_path: Path | None = None,
+    staging_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
     on_stage: StageCallback | None = None,
 ) -> Path:
-    """Produces a temp file (same directory as video_path, so the final publish
-    step is a same-filesystem atomic rename, not a cross-filesystem copy) with
-    the video blurred during blur_intervals and every audio stream muted during
+    """Produces a temp file (beside video_path by default, or in staging_dir
+    for a separate output library) with the video blurred during
+    blur_intervals and every audio stream muted during
     mute_intervals -- deliberately separate lists, not the same windows reused
     for both: blurring is what every approved scene gets, muting is an explicit
     per-scene opt-in (default off) since plot-relevant nudity doesn't always
     mean the dialogue over it needs muting too. mute_intervals is always a
     subset of blur_intervals. Everything else (subtitles/chapters/attachments)
-    passed through untouched.
+    passed through untouched. audio_source_path optionally substitutes an
+    audio-only clean master for the original audio. Video and metadata still
+    come from the original, never a previous blurred edit: this preserves
+    profanity filtering while letting a later Apply remove rejected scene
+    blurs/mutes without cumulative video/audio quality loss.
 
     work_dir is a persistent, caller-owned directory (see apply_blur -- it's
     keyed off the SceneJob id, under app_settings.data_dir so it survives a
@@ -1446,7 +1452,9 @@ async def build_blurred_video(
     directly-confirmed corruption case that motivated this)."""
     src_probe = await probe(ffprobe_bin, video_path)
     total_duration = float(src_probe["format"].get("duration", 0))
-    audio_streams = _audio_streams(src_probe)
+    audio_source = audio_source_path or video_path
+    audio_probe = await probe(ffprobe_bin, audio_source) if audio_source_path is not None else src_probe
+    audio_streams = _audio_streams(audio_probe)
     if not audio_streams:
         raise RemuxError("No audio streams found in source file")
 
@@ -1456,11 +1464,20 @@ async def build_blurred_video(
     # and one job's failure/cancel cleanup could delete it out from under the
     # other mid-mux.
     tmp_path = video_path.with_name(f".{video_path.stem}.spf-blur-tmp.{work_dir.name}{video_path.suffix}")
+    if staging_dir is not None:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = staging_dir / tmp_path.name
 
     work_dir.mkdir(parents=True, exist_ok=True)
     fingerprint = _blur_job_fingerprint(
         video_path, blur_intervals, mute_intervals, video_crf, video_preset, blur_radius, blur_power, audio_bitrate
     )
+    if audio_source_path is not None:
+        # Cached audio can change while the video/scene plan stays identical.
+        # Reusing old muted/copy audio segments would silently undo a newly
+        # processed profanity setting on an interrupted blur retry.
+        from app.output import source_fingerprint
+        fingerprint += ':' + source_fingerprint(audio_source_path)
     _reset_stale_work_dir(work_dir, fingerprint)
     tmp_root = work_dir
 
@@ -1751,14 +1768,14 @@ async def build_blurred_video(
                 if len(audio_segments) > 1:
                     audio_boundaries = [s.end for s in audio_segments[:-1]]
                     await _split_copy_audio_segments(
-                        ffmpeg_bin, video_path, audio_boundaries, len(audio_streams), tmp_root
+                        ffmpeg_bin, audio_source, audio_boundaries, len(audio_streams), tmp_root
                     )
                 for i, aseg in enumerate(audio_segments):
                     if aseg.mute:
                         aseg_ts_path = tmp_root / f"amute_{i:04d}.mkv"
                         if not aseg_ts_path.exists():
                             await _extract_mute_audio_segment(
-                                ffmpeg_bin, video_path, aseg, len(audio_streams), audio_bitrate, aseg_ts_path
+                                ffmpeg_bin, audio_source, aseg, len(audio_streams), audio_bitrate, aseg_ts_path
                             )
                     else:
                         # Same duration/start_time metadata problem and fix
@@ -1783,6 +1800,7 @@ async def build_blurred_video(
             video_path=video_path,
             concatenated_video_path=concatenated_video_path,
             concatenated_audio_path=concatenated_audio_path,
+            **({'audio_source_path': audio_source_path} if audio_source_path is not None else {}),
             audio_streams=audio_streams,
             out_path=tmp_path,
             timeout=timeout,
@@ -1804,12 +1822,15 @@ async def _mux_final_output(
     concatenated_video_path: Path,
     concatenated_audio_path: Path | None,
     audio_streams: list[dict],
+    audio_source_path: Path | None = None,
     out_path: Path,
     timeout: float,
 ) -> None:
     """Combines the already-fully-processed concatenated video (input 0, pure
     stream-copy here -- all the real encoding work already happened per-segment)
     with the original source's subtitles/chapters/metadata (input 1) and audio.
+    An external-library clean audio master may replace original audio (input
+    2) without changing where video, subtitles, or metadata come from.
 
     Audio comes from wherever it was actually processed: concatenated_audio_path
     (input 2, already fully muted+copied+concatenated by the split pipeline in
@@ -1821,9 +1842,9 @@ async def _mux_final_output(
     codec_args = ["-c:v", "copy"]
 
     inputs = [concatenated_video_path, video_path]
-    if concatenated_audio_path is not None:
+    if concatenated_audio_path is not None or audio_source_path is not None:
         audio_input_index = 2
-        inputs.append(concatenated_audio_path)
+        inputs.append(concatenated_audio_path or audio_source_path)
     else:
         audio_input_index = 1
     for i in range(len(audio_streams)):
@@ -1927,6 +1948,8 @@ async def apply_blur(
     blur_power: int = 8,
     on_progress: ProgressCallback | None = None,
     on_stage: StageCallback | None = None,
+    output_path: Path | None = None,
+    audio_source_path: Path | None = None,
 ) -> Path:
     """work_dir: a persistent directory (see app.scenes.pipeline.apply_scene_blur
     for how it's derived from the SceneJob id) that build_blurred_video reuses
@@ -1951,7 +1974,13 @@ async def apply_blur(
         raise RemuxError("No approved scene windows to apply")
     await asyncio.to_thread(remove_orphaned_temp_files, video_path)
 
+    if output_path is not None and output_path.resolve() == video_path.resolve():
+        raise RemuxError('Separate output must not overwrite the source video')
     src_probe = await probe(ffprobe_bin, video_path)
+    if audio_source_path is not None:
+        audio_probe = await probe(ffprobe_bin, audio_source_path)
+        src_probe = {**src_probe, 'streams': [s for s in src_probe['streams'] if s['codec_type'] != 'audio']
+                     + _audio_streams(audio_probe)}
 
     async def _build_and_verify(*, force_whole_file_video: bool) -> Path:
         tmp_path = await build_blurred_video(
@@ -1966,6 +1995,8 @@ async def apply_blur(
             blur_radius=blur_radius,
             blur_power=blur_power,
             force_whole_file_video=force_whole_file_video,
+            **({'audio_source_path': audio_source_path} if audio_source_path is not None else {}),
+            **({'staging_dir': output_path.parent} if output_path is not None else {}),
             on_progress=on_progress,
             on_stage=on_stage,
         )
@@ -1996,11 +2027,12 @@ async def apply_blur(
         )
         tmp_path = await _build_and_verify(force_whole_file_video=True)
 
-    final_path = sibling_edit_path(video_path)
+    final_path = output_path or sibling_edit_path(video_path)
     try:
         if on_stage is not None:
             await on_stage("Publishing Vulgarr Edit")
-        tmp_path.replace(final_path)  # same-directory rename: atomic, no partial-file window
+        from app.output import publish_file
+        await publish_file(tmp_path, final_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise

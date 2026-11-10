@@ -135,11 +135,22 @@ class Title(Base):
     # anything else needs to switch on.
     scene_scan_status: Mapped[str] = mapped_column(String(20), default="not_scanned", nullable=False)
 
-    # Set once a blur "Apply" run successfully produces the sibling "Vulgarr Edit"
-    # file (see app/scenes/pipeline.py) -- re-running Apply after more scenes are
-    # approved regenerates both fields. Never points at the original video_path.
+    # Set by a blur Apply or separate-library audio run. Reprocessing publishes
+    # a replacement at the configured destination (legacy blur uses a sibling).
+    # Never points at the original video_path.
     vulgarr_edit_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     vulgarr_edit_generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # External-output mode keeps an audio-only master in a private .vulgarr
+    # folder beside the edited video. Blurs are
+    # always regenerated from original video + this un-scene-muted audio, so
+    # later rejects can remove old blur/mute windows without losing profanity
+    # filtering or storing a second full-resolution video master.
+    clean_audio_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    clean_audio_source_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Source-side indices are a different namespace after switching to a
+    # separate output. Retain them for older MP4s whose clean-track tags did
+    # not survive muxing; never feed destination indices into the source plan.
+    source_clean_track_audio_indices: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     jobs: Mapped[list["ProcessingJob"]] = relationship(back_populates="title", cascade="all, delete-orphan")
     detected_scenes: Mapped[list["DetectedScene"]] = relationship(back_populates="title", cascade="all, delete-orphan")

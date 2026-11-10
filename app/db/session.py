@@ -34,6 +34,9 @@ _COLUMNS_ADDED_LATER = [
     ("processing_jobs", "progress_percent", "FLOAT"),
     ("titles", "scene_scan_status", "VARCHAR(20) NOT NULL DEFAULT 'not_scanned'"),
     ("titles", "vulgarr_edit_path", "VARCHAR(1024)"),
+    ("titles", "clean_audio_path", "VARCHAR(1024)"),
+    ("titles", "clean_audio_source_fingerprint", "VARCHAR(64)"),
+    ("titles", "source_clean_track_audio_indices", "VARCHAR(40)"),
     ("titles", "vulgarr_edit_generated_at", "DATETIME"),
     ("detected_scenes", "verified_fraction", "FLOAT"),
     ("detected_scenes", "mute_audio", "BOOLEAN NOT NULL DEFAULT 0"),
@@ -175,6 +178,9 @@ async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 # Settings page from then on -- editing them there no longer requires a
 # redeploy/restart.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # Empty roots preserve legacy in-place audio and sibling blur behavior.
+    "movie_output_folder": "",
+    "tv_output_folder": "",
     "wordlist_version": 1,
     "concurrency_cap": settings.default_concurrency,
     "off_hours_enabled": False,

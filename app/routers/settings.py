@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -32,6 +34,8 @@ SETTING_KEYS = [
     "default_subtitle_language",
     "backups_enabled",
     "backup_retention_days",
+    "movie_output_folder",
+    "tv_output_folder",
     "auth_mode",
     "auth_username",
     "sso_issuer_url",
@@ -126,6 +130,8 @@ async def update_settings(
     default_subtitle_language: str = Form("en"),
     backups_enabled: bool = Form(False),
     backup_retention_days: int = Form(0),
+    movie_output_folder: str = Form(""),
+    tv_output_folder: str = Form(""),
     auth_mode: str = Form("none"),
     auth_username: str = Form(""),
     auth_password: str = Form(""),
@@ -154,6 +160,15 @@ async def update_settings(
     claude_vision_model: str = Form("claude-sonnet-5"),
     claude_vision_skip_above_fraction: float = Form(0.9),
 ):
+    movie_output_folder = movie_output_folder.strip()
+    tv_output_folder = tv_output_folder.strip()
+    if any(folder and not Path(folder).is_absolute() for folder in (movie_output_folder, tv_output_folder)):
+        values = await _load_all()
+        values.update(movie_output_folder=movie_output_folder, tv_output_folder=tv_output_folder)
+        return templates.TemplateResponse('partials/settings_form.html', {
+            'request': request, 'values': values,
+            'output_folder_error': 'Output folders must be absolute paths inside the Vulgarr container. No settings were saved.',
+        })
     trigger_priority_second = "bazarr" if trigger_priority_first == "sonarr_radarr" else "sonarr_radarr"
 
     async with get_session() as session:
@@ -184,6 +199,8 @@ async def update_settings(
         await set_setting(session, "default_subtitle_language", default_subtitle_language.strip() or "en")
         await set_setting(session, "backups_enabled", backups_enabled)
         await set_setting(session, "backup_retention_days", max(0, backup_retention_days))
+        await set_setting(session, "movie_output_folder", movie_output_folder)
+        await set_setting(session, "tv_output_folder", tv_output_folder)
 
         # auth_mode is only allowed to actually switch to "password" once a
         # username and (new or existing) password are in place, or to "sso" once
