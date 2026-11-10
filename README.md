@@ -65,9 +65,10 @@ only from an explicit "Scan for scenes" click, since a scan has a real CPU
 cost and Apply produces a full second encoded copy of the file):
 
 1. **Scan** (`app/vision/classifier.py`): samples frames from the video at a
-   configurable interval and classifies each with a local, self-hosted model
-   (no data leaves your machine for this step) — no ASR/subtitles involved,
-   this is purely a visual classifier.
+   configurable interval and classifies each with a self-hosted model
+   (local by default, or optional remote GPU workers) — no ASR/subtitles
+   involved, this is purely a visual classifier. Local extraction overlaps
+   classification across bounded chunks, retaining per-frame resume checkpoints.
 2. **Cluster** (`app/vision/scene_cluster.py`): merges nearby hits into
    candidate scenes, then does a second, denser re-scan of just each
    candidate's padded window to refine its actual start/end and compute a
@@ -87,6 +88,25 @@ cost and Apply produces a full second encoded copy of the file):
    sibling **"Vulgarr Edit"** file — the original is never touched. Re-running
    Apply after approving/rejecting more scenes always rebuilds from whatever's
    currently approved.
+
+## Remote GPU workers (this fork)
+
+See [remote_worker/README.md](remote_worker/README.md) for batch inference,
+optional worker-side chunk extraction, token-authenticated media streaming,
+worker status/throughput reporting, and opt-in NVENC blur-segment encoding.
+All remote failures retain a local path; audio and blur keep their heavy-I/O
+mutual exclusion. Remote extraction fallback reacquires that gate locally.
+
+Build/deploy **this fork's image** to use these features; the upstream `:stable`
+image in the production compose example does not include these changes. Set
+`SPF_CLASSIFIER_URLS` for inference offload. Worker-side extraction also requires
+`SPF_REMOTE_EXTRACT=1`, `SPF_INTERNAL_BASE_URL`, and `SPF_INTERNAL_TOKEN` on
+vulgarr, plus `SPF_SOURCE_BASE_URL` on each worker. Keep worker ports private.
+
+Remote encoding (`SPF_REMOTE_ENCODE_URL`) is off by default and conservatively
+rejects incompatible streams, especially HEVC parameter-set mismatches. It has
+unit coverage with mocked ffmpeg, **not real GPU/splice qualification**: follow
+the worker README's real-media validation checklist before production use.
 
 ## Features
 

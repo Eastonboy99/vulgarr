@@ -73,6 +73,14 @@ def configure_remote(monkeypatch):
     monkeypatch.setenv('SPF_INTERNAL_TOKEN', 'secret')
 
 
+@pytest.mark.parametrize('detections', [None, {}, [{}], [{'class': 'FACE_FEMALE'}],
+    [{'class': 'FACE_FEMALE', 'score': float('nan')}],
+    [{'class': 'FEMALE_BREAST_EXPOSED', 'score': 2}]])
+def test_invalid_remote_detections_are_not_zero_scores(detections):
+    with pytest.raises(ValueError):
+        classifier._validate_remote_detections(detections)
+
+
 def test_remote_requires_complete_configuration(monkeypatch):
     configure_remote(monkeypatch)
     assert remote_extract_enabled()

@@ -70,11 +70,7 @@ async def _detect(frame_path: Path, local_detector_callable) -> list[dict]:
                 )
             if resp.status_code == 200:
                 detections = resp.json()['detections']
-                if not isinstance(detections, list):
-                    raise ValueError('Invalid remote detections')
-                confidence = frame_confidence(detections)
-                if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-                    raise ValueError('Invalid remote confidence')
+                _validate_remote_detections(detections)
                 counts = _scan_remote_counts.get()
                 if counts is not None:
                     counts['ok'] += 1
@@ -144,6 +140,22 @@ def extract_frame(
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0 or not out_path.exists():
         raise RuntimeError(f"ffmpeg frame extraction failed at {timestamp:.2f}s in {video_path}")
+
+
+def _validate_remote_detections(detections) -> None:
+    """Reject malformed successful responses before they become a safe-looking
+    zero score. Even non-explicit classes must retain NudeNet's class/score
+    shape; otherwise a broken worker could silently hide genuine exposure.
+    """
+    if not isinstance(detections, list):
+        raise ValueError('Invalid remote detections')
+    for detection in detections:
+        if (not isinstance(detection, dict)
+                or not isinstance(detection.get('class'), str)
+                or not isinstance(detection.get('score'), (int, float))
+                or not math.isfinite(detection['score'])
+                or not 0 <= detection['score'] <= 1):
+            raise ValueError('Invalid remote detection')
 
 
 def frame_confidence(detections: list[dict]) -> float:
@@ -574,9 +586,7 @@ async def _scan_frames(
                             raise ValueError('incomplete batch response')
                         # Validate before trusting any part of the response.
                         for result in results:
-                            confidence = frame_confidence(result)
-                            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-                                raise ValueError('Invalid batch confidence')
+                            _validate_remote_detections(result)
                         remote_ok += len(items)
                     except Exception:
                         logger.warning('Batch classifier failed; retrying individual frames', exc_info=True)
