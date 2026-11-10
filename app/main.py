@@ -16,8 +16,10 @@ from app.routers import auth as auth_router
 from app.routers import remote_workers
 from app.routers import library, queue, scenes, settings as settings_router, setup as setup_router, webhooks, wordlist
 from app.session_secret import get_or_create_session_secret_key
+from app.vision.remote_source import install_source_log_redaction
 
 logging.basicConfig(level=logging.INFO)
+install_source_log_redaction()
 
 
 @asynccontextmanager

@@ -20,6 +20,7 @@ RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel \
   && pip3 install --no-cache-dir --force-reinstall --no-deps onnxruntime-gpu==1.20.2
 
 COPY server.py .
+COPY render.py remote_worker/render.py
 
 VOLUME ["/models"]
 EXPOSE 7861

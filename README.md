@@ -174,10 +174,17 @@ image in the production compose example does not include these changes. Set
 `SPF_REMOTE_EXTRACT=1`, `SPF_INTERNAL_BASE_URL`, and `SPF_INTERNAL_TOKEN` on
 vulgarr, plus `SPF_SOURCE_BASE_URL` on each worker. Keep worker ports private.
 
-Remote encoding (`SPF_REMOTE_ENCODE_URL`) is off by default and conservatively
-rejects incompatible streams, especially HEVC parameter-set mismatches. It has
-unit coverage with mocked ffmpeg, **not real GPU/splice qualification**: follow
-the worker README's real-media validation checklist before production use.
+Remote encoding (`SPF_REMOTE_ENCODE_URL`, a worker base URL) is off by default.
+Segment encoding conservatively rejects incompatible streams, especially HEVC
+parameter-set mismatches. Whole-file recovery also queries the worker—even when
+keyframe/split planning failed before any segment request. It tries worker NVENC,
+then worker software encoding, before falling back to server CPU. This requires
+`SPF_INTERNAL_BASE_URL` and `SPF_INTERNAL_TOKEN` on vulgarr and the matching
+`SPF_SOURCE_BASE_URL` on the worker; remote scanning need not be enabled.
+Rebuild **both** images for the pollable `/render` API. Queue messages distinguish
+remote rendering, downloading, validation and server fallback. Unit coverage uses
+mocked ffmpeg, **not real GPU/media qualification**: follow the worker README's
+real-media validation checklist before production use.
 
 ## Features
 

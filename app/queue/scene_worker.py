@@ -318,6 +318,7 @@ class SceneJobQueue:
             job_start_monotonic = time.monotonic()
             last_update_monotonic = 0.0
             scan_phase = "Scanning for scenes"
+            blur_phase = "Blurring video (ffmpeg)"
             scan_counters = ""
 
             async def on_scan_progress(done: int, total: int) -> None:
@@ -359,7 +360,7 @@ class SceneJobQueue:
                     return
                 last_update_monotonic = now
                 job.progress_percent = round(fraction * 97.0, 1)
-                message = f"Blurring video (ffmpeg) -- {round(fraction * 100):.0f}%"
+                message = f"{blur_phase} -- {round(fraction * 100):.0f}%"
                 if fraction > 0.02 and not is_final:
                     elapsed = now - job_start_monotonic
                     eta_seconds = elapsed * (1 - fraction) / fraction
@@ -368,6 +369,8 @@ class SceneJobQueue:
                 await session.commit()
 
             async def on_blur_stage(message: str) -> None:
+                nonlocal blur_phase
+                blur_phase = message
                 job.progress_message = message
                 await session.commit()
 

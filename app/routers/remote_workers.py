@@ -92,7 +92,11 @@ async def workers(request: Request):
             return {'url': url, 'online': True, **response.json()}
         except Exception:
             return {'url': url, 'online': False}
+    urls = list(_classifier_urls())
+    encoder = os.getenv('SPF_REMOTE_ENCODE_URL', '').strip().rstrip('/')
+    if encoder and encoder not in urls:
+        urls.append(encoder)
     async with httpx.AsyncClient(timeout=2.0) as client:
-        rows = await asyncio.gather(*(ping(client, url) for url in _classifier_urls()))
+        rows = await asyncio.gather(*(ping(client, url) for url in urls))
     return templates.TemplateResponse('partials/worker_status.html',
                                       {'request': request, 'workers': rows})

@@ -1206,12 +1206,17 @@ async def _build_video_whole_file_reencode(
     source_codec: str,
     out_path: Path,
     on_progress: ProgressCallback | None = None,
+    on_stage: StageCallback | None = None,
+    source_probe: dict | None = None,
 ) -> None:
     """Fallback for when the split/copy/re-encode/concat pipeline (see
     build_blurred_video) fails -- decodes and re-encodes the ENTIRE file in one
     continuous ffmpeg session instead of stream-copying the untouched parts
     around a handful of re-encoded scenes, at the cost of a full re-encode
-    instead of a partial one.
+    instead of a partial one. With remote encoding configured, this recovery
+    path also runs on the worker (NVENC, then worker CPU), rather than quietly
+    bypassing workers when keyframe planning failed before any segment call.
+    Server CPU remains the final safety net. No mixed-codec splices are used.
 
     Real motivation: confirmed directly, live, against a real file (28 Years
     Later) that the segment pipeline can produce two independently
@@ -1258,6 +1263,42 @@ async def _build_video_whole_file_reencode(
     filter_str = build_blur_filter(
         blur_intervals, input_label="0:v", output_label="vb", radius=blur_radius, power=blur_power
     )
+    if os.getenv('SPF_REMOTE_ENCODE_URL', '').strip():
+        from app.config import settings as app_settings
+        from app.mux.remote_render import try_remote_render
+        from app.vision.remote_source import remote_source_enabled
+        # Avoid extra source probing if transport is not configured. The client
+        # emits a visible reason rather than silently selecting server CPU.
+        if remote_source_enabled():
+            source_probe = source_probe or await probe(app_settings.ffprobe_bin, video_path)
+        source_video = next((s for s in (source_probe or {}).get('streams', [])
+                             if s['codec_type'] == 'video'), {})
+
+        async def validate_remote(path):
+            remote_probe = await probe(app_settings.ffprobe_bin, path)
+            streams = remote_probe['streams']
+            expected_codec = {'libx265': 'hevc', 'libx264': 'h264', 'libvpx-vp9': 'vp9',
+                              'libsvtav1': 'av1'}.get(codec, codec)
+            if (len(streams) != 1 or streams[0].get('codec_type') != 'video'
+                    or streams[0].get('codec_name') != expected_codec
+                    or any(streams[0].get(k) != source_video.get(k) for k in ('width', 'height', 'pix_fmt'))):
+                raise RemuxError('Remote whole-video stream identity mismatch')
+            await verify_blurred_output(
+                ffmpeg_bin=ffmpeg_bin, ffprobe_bin=app_settings.ffprobe_bin,
+                original_probe={'streams': [source_video], 'format': {'duration': total_duration}},
+                tmp_path=path, blurred_windows=blur_intervals,
+            )
+
+        if await try_remote_render(
+                video_path=video_path, out_path=out_path, source_codec=source_codec,
+                source_video=source_video, duration=total_duration, crf=video_crf,
+                preset=_WHOLE_FILE_FALLBACK_PRESET, filter_complex=filter_str,
+                timeout=_WHOLE_FILE_REENCODE_TIMEOUT_SECONDS, validate=validate_remote,
+                on_progress=on_progress, on_stage=on_stage):
+            return
+    if on_stage is not None:
+        suffix = ' (remote fallback)' if os.getenv('SPF_REMOTE_ENCODE_URL', '').strip() else ''
+        await on_stage('Whole-file blur — server CPU' + suffix)
     tmp_out = out_path.with_name(out_path.name + ".tmp")
     cmd = [
         ffmpeg_bin, "-y", "-nostdin", "-loglevel", "error", "-progress", "pipe:1",
@@ -1497,6 +1538,7 @@ async def build_blurred_video(
             await _build_video_whole_file_reencode(
                 ffmpeg_bin, video_path, blur_intervals, video_crf, total_duration, blur_radius, blur_power,
                 video_codec, concatenated_video_path, on_progress=on_progress,
+                on_stage=on_stage, source_probe=src_probe,
             )
         else:
             if on_stage is not None:

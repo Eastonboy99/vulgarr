@@ -11,10 +11,8 @@ The model (~70MB) is downloaded to /models on first use and cached there.
 
 import tempfile
 import asyncio
-import os
 import math
 import subprocess
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 import threading
@@ -25,11 +23,18 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 import json
-import re
 from nudenet import NudeDetector
 from starlette.concurrency import run_in_threadpool
 
+from remote_worker.render import (
+    router as render_router, encode_slot as _encode_slot,
+    render_stats, startup_renders, shutdown_renders, validate_blur_filter, validate_source,
+)
+
 app = FastAPI(title="vulgarr-remote-classifier")
+app.include_router(render_router)
+app.add_event_handler('startup', startup_renders)
+app.add_event_handler('shutdown', shutdown_renders)
 
 # One detector per process; a process is pinned to a single GPU via
 # NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES in compose.
@@ -113,20 +118,11 @@ class EncodeParams(BaseModel):
     filter_complex: str = Field(max_length=100000)
 
 
-_encode_slot = asyncio.Semaphore(1)
-
-
 def _encode_segment(source: Path, output: Path, params: EncodeParams):
     # The worker is private-network only, but accepting arbitrary ffmpeg
     # graphs would still allow movie=/etc/... or network-source filters. Only
     # accept the host's boxblur grammar, never general ffmpeg expressions.
-    label = r'(?:0:v|vb(?:_stage\d+)?)'
-    number = r'\d+\.\d{3}'
-    term = rf'between\(t,{number},{number}\)'
-    stage = (rf'\[{label}\]boxblur=luma_radius=\d+:luma_power=\d+:'
-             rf"chroma_radius=\d+:chroma_power=\d+:enable='{term}(?:\+{term})*'\[{label}\]")
-    if not re.fullmatch(rf'(?:{stage})(?:;{stage})*|\[0:v\]null\[vb\]', params.filter_complex):
-        raise ValueError('Unsupported blur graph')
+    validate_blur_filter(params.filter_complex)
     encoder = {'hevc': 'hevc_nvenc', 'h265': 'hevc_nvenc', 'h264': 'h264_nvenc'}.get(params.source_codec)
     if encoder is None:
         raise ValueError('Source codec has no compatible NVENC mapping')
@@ -208,11 +204,7 @@ def _scan_chunk(params: ScanRequest) -> list[dict]:
     HTTP source capabilities are restricted to a configured vulgarr origin,
     preventing this endpoint from becoming an arbitrary URL fetch proxy.
     """
-    trusted = urlsplit(os.getenv('SPF_SOURCE_BASE_URL', ''))
-    supplied = urlsplit(params.source_url)
-    if (trusted.scheme not in {'http', 'https'} or supplied.scheme != trusted.scheme
-            or supplied.netloc != trusted.netloc or supplied.path != '/internal/source'):
-        raise ValueError('Source must use SPF_SOURCE_BASE_URL origin and /internal/source')
+    validate_source(params.source_url)
     if math.ceil(params.duration / params.interval) > 10000:
         raise ValueError('Too many frames in chunk')
     with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +265,7 @@ async def stats() -> dict:
     count = _stats['requests_served']
     return {
         **_stats,
+        **render_stats(),
         'device': ('GPU' if 'CUDAExecutionProvider' in providers else 'CPU') if det else 'not loaded',
         'providers': providers,
         'avg_latency_ms': 1000 * _stats['total_latency_seconds'] / count if count else 0,

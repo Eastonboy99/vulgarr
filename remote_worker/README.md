@@ -108,7 +108,8 @@ which is not numerically identical to libx26x CRF. Segment uploads are capped at
 4 GiB. The image installs ffmpeg and requests NVIDIA `video` driver capabilities
 for NVDEC/NVENC; check the deployed image with `ffmpeg -encoders` and a real
 encode because the available GPU/driver may still lack a requested capability.
-CPU-only workers return 503 for encoding; classification continues to work.
+CPU-only workers return 503 from the segment `/encode` endpoint; classification
+and the software whole-video renderer below continue to work.
 
 **Codec identity alone does not establish splice safety.** Vulgarr rejects
 remote output when codec/profile/pixel format/resolution/color/frame-rate
@@ -119,6 +120,69 @@ back on an otherwise healthy worker. A returned MKV must decode cleanly before
 it becomes a completed segment. The existing concatenation, whole-output decode
 verification, matched-x265 CPU encoder and whole-file fallback remain intact.
 Any transport/encode/validation failure retries the original local encoder.
+
+## Whole-video recovery offload
+
+A split/keyframe/concat failure can select whole-file recovery **before any
+`/encode` request is made**. That used to bypass workers completely. Recovery
+now submits a pollable `/render` job to `SPF_REMOTE_ENCODE_URL` too. Rebuild and
+redeploy **both vulgarr and the workers**; an older worker returns HTTP 404 and
+vulgarr safely uses server CPU, with a warning and explicit queue phase.
+
+```dotenv
+# Vulgarr container (use the actual address/port reachable from the worker):
+SPF_REMOTE_ENCODE_URL=http://gpu-host:7861
+SPF_INTERNAL_BASE_URL=http://vulgarr-host:8000
+SPF_INTERNAL_TOKEN=<a-long-random-secret>
+
+# Worker container; same scheme/host/port as SPF_INTERNAL_BASE_URL:
+SPF_SOURCE_BASE_URL=http://vulgarr-host:8000
+SPF_RENDER_WORK_DIR=/work
+```
+
+The worker streams the signed, file-scoped HTTP source; it needs neither a
+shared media mount nor the signing secret. Source transport configuration is
+required, but `SPF_REMOTE_EXTRACT` and `SPF_CLASSIFIER_URLS` are **not** required
+for recovery rendering. Missing source settings are explained in the queue and
+logs rather than silently selecting local encoding. Use private networking/TLS;
+render capabilities last up to the 24-hour job deadline plus one hour so later
+range reads do not expire mid-encode. Vulgarr redacts their query strings in
+Uvicorn access logs; configure external proxies/log collectors to do likewise.
+Do not log or share signed source URLs.
+
+For H.264/HEVC, the worker tries NVENC with CUDA decode, then NVENC with CPU
+decode, then codec-matched **software encoding on the worker**, not on the
+vulgarr server. Other codecs use worker software encoders. Output codec,
+resolution, decoded pixel format and duration are checked before accepting a
+render. Whole-video NVENC is safe from the *mixed-SPS/PPS splice failure class*
+because every video frame is encoded in one continuous session; this does not
+relax any segment compatibility checks or replace real-media qualification.
+
+- `POST /render`: validates the restricted blur graph/source origin and returns
+  a job ID (202); `GET /render/{id}` reports queue state, backend and progress.
+- `GET /render/{id}/output`: downloads the completed video-only MKV and removes
+  its temporary files afterward. `DELETE /render/{id}` cancels ffmpeg and cleans
+  up; worker shutdown cancels jobs too.
+- One shared encode slot serializes `/encode` and whole-video renders. At most
+  two render jobs/results are retained per process. A 24-hour deadline covers
+  queueing and all attempts; unclaimed completed results expire on later
+  submissions. Run **one uvicorn process per worker container**, not multiple
+  `--workers` sharing the in-memory job registry.
+- Provide enough worker disk space for full video outputs. The compose example
+  gives each worker its own `/work` volume. `SPF_RENDER_WORK_DIR` must be dedicated
+  to that process: startup sweeps its `vulgarr-render-*` directories left by hard
+  kills. It never sweeps shared system `/tmp` or unrelated directories.
+- `/stats` advertises `whole_video_render: true`, render activity and completed
+  render count. The queue worker panel shows those separately from inference
+  requests. Its device/providers field describes **inference**, not NVENC.
+- The server still performs metadata probes, video validation, final audio/mux
+  and atomic publication. Seeing server-side ffmpeg does not itself mean blur
+  encoding is local. The queue explicitly says `Remote whole-file blur`,
+  `Downloading`, `Validating`, or `server CPU (remote fallback)`.
+
+Worker failures and invalid output preserve the local CPU safety net and do
+not install a partial video checkpoint or overwrite the published edit. Network
+loss/host crash cannot resume a whole-video encode in place; it may be retried.
 
 ### Deployment validation (required before enabling production encode offload)
 
@@ -133,5 +197,11 @@ splice compatibility. On the actual GPU and representative H.264/HEVC media:
    including audio sync. Repeat for 8/10-bit HEVC, sparse GOPs and HDR sources.
 4. Shut the worker down mid-scan and mid-encode; confirm local fallback, then
    restart vulgarr mid-scan to verify checkpoint continuation.
-5. If any mismatch/corruption appears, unset `SPF_REMOTE_ENCODE_URL`; do not
+5. Exercise whole-file recovery (including a source that fails keyframe/split
+   planning). Confirm `/render` is queried, the queue identifies the worker
+   backend, and the server does not run a boxblur/video encoder for that path.
+   Repeat with NVENC unavailable to exercise worker CPU; interrupt a render and
+   a result download to check cancellation/cleanup and local fallback. Check
+   delayed audio, 10-bit/HDR metadata and scene on/off timing in the final mux.
+6. If any mismatch/corruption appears, unset `SPF_REMOTE_ENCODE_URL`; do not
    relax the compatibility checks to make a particular GPU pass.

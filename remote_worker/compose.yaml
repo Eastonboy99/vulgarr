@@ -10,8 +10,9 @@ services:
       NVIDIA_VISIBLE_DEVICES: "${SPF_GPU_0:-0}"
       CUDA_VISIBLE_DEVICES: "${SPF_GPU_0:-0}"
       SPF_SOURCE_BASE_URL: ${SPF_SOURCE_BASE_URL:-}
+      SPF_RENDER_WORK_DIR: /work
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
-    volumes: ["models-0:/models"]
+    volumes: ["models-0:/models", "renders-0:/work"]
     deploy:
       resources:
         reservations:
@@ -27,8 +28,9 @@ services:
       NVIDIA_VISIBLE_DEVICES: "${SPF_GPU_1:-1}"
       CUDA_VISIBLE_DEVICES: "${SPF_GPU_1:-1}"
       SPF_SOURCE_BASE_URL: ${SPF_SOURCE_BASE_URL:-}
+      SPF_RENDER_WORK_DIR: /work
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
-    volumes: ["models-1:/models"]
+    volumes: ["models-1:/models", "renders-1:/work"]
     deploy:
       resources:
         reservations:
@@ -39,3 +41,5 @@ services:
 volumes:
   models-0:
   models-1:
+  renders-0:
+  renders-1:
