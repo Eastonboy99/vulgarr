@@ -13,6 +13,7 @@ from app.library import reconcile_stale_awaiting_subtitle_titles
 from app.queue.scene_worker import scene_job_queue
 from app.queue.worker import job_queue
 from app.routers import auth as auth_router
+from app.routers import remote_workers
 from app.routers import library, queue, scenes, settings as settings_router, setup as setup_router, webhooks, wordlist
 from app.session_secret import get_or_create_session_secret_key
 
@@ -46,6 +47,7 @@ app.add_middleware(SetupWizardGateMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_or_create_session_secret_key(app_settings.data_dir), same_site="lax")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
+app.include_router(remote_workers.router)
 app.include_router(library.router)
 app.include_router(scenes.router)
 app.include_router(wordlist.router)

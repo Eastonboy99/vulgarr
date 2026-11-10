@@ -19,7 +19,9 @@ from starlette.responses import RedirectResponse, Response
 
 from app.db.session import get_session, get_setting, verify_password
 
-_EXEMPT_PREFIXES = ("/webhooks", "/static", "/auth")
+# This endpoint authenticates a short-lived file-scoped HMAC capability,
+# not a browser session (worker ffmpeg cannot log in through SSO).
+_EXEMPT_PREFIXES = ("/webhooks", "/static", "/auth", "/internal/source")
 
 
 class AuthGateMiddleware(BaseHTTPMiddleware):
@@ -75,7 +77,7 @@ def _credentials_valid(auth_header: str | None, username: str, password_hash: st
     return hmac.compare_digest(supplied_user, username) and verify_password(supplied_pass, password_hash)
 
 
-_WIZARD_EXEMPT_PREFIXES = ("/setup", "/static", "/webhooks")
+_WIZARD_EXEMPT_PREFIXES = ("/setup", "/static", "/webhooks", "/internal/source")
 
 
 class SetupWizardGateMiddleware(BaseHTTPMiddleware):

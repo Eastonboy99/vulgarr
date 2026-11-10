@@ -10,6 +10,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ from pathlib import Path
 import httpx
 
 from app.vision.scene_cluster import FrameScore
+from app.vision.remote_source import remote_extract_enabled, source_url
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +387,7 @@ async def _scan_frames(
     # Only the resumable whole-file path chunks -- scan_window_frames (no
     # resume_scores_path) keeps its original single-pass behavior exactly,
     # since its clips are already short enough not to need this.
-    chunk_size = _SCAN_CHUNK_SECONDS if resume_scores_path is not None else remaining_duration
+    chunk_size = min(_SCAN_CHUNK_SECONDS, remaining_duration) if (resume_scores_path is not None or remote_extract_enabled()) else remaining_duration
 
     # Local detector is loaded lazily: when SPF_CLASSIFIER_URLS is set and the
     # workers stay healthy, nudenet/onnxruntime is never imported on this host
@@ -428,7 +430,7 @@ async def _scan_frames(
     prepared = asyncio.Queue()
     slots = asyncio.Semaphore(2)
     owned_dirs = []
-    chunk_count = max(1, __import__('math').ceil(remaining_duration / chunk_size))
+    chunk_count = max(1, math.ceil(remaining_duration / chunk_size))
     extracted_fraction = 0.0
     remote_ok = remote_fallback = in_flight = 0
     started = time.monotonic()
@@ -448,23 +450,63 @@ async def _scan_frames(
                 await on_progress(progress_high_water, expected_total)
 
     async def produce():
-        nonlocal extracted_fraction
+        nonlocal extracted_fraction, remote_ok, remote_fallback
         offset = 0.0
         try:
             for number in range(chunk_count):
                 await slots.acquire()
                 duration = min(chunk_size, remaining_duration - offset)
+                remote_scores = None
+                if remote_extract_enabled():
+                    await report(f"Extracting chunk {number + 1}/{chunk_count} (remote)")
+                    try:
+                        urls = _classifier_urls()
+                        url = urls[next(_remote_rr) % len(urls)]
+                        response = await _remote_http_client().post(
+                            url + '/scan', timeout=660,
+                            json={'source_url': source_url(video_path),
+                                  'start': effective_start_offset + offset,
+                                  'duration': duration, 'interval': frame_interval_seconds},
+                        )
+                        response.raise_for_status()
+                        remote_scores = response.json()['scores']
+                        count = max(1, round(duration / frame_interval_seconds))
+                        if len(remote_scores) != count:
+                            raise ValueError('Incomplete remote scan')
+                        for i, score in enumerate(remote_scores):
+                            expected = effective_start_offset + offset + i * frame_interval_seconds
+                            if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
+                                raise ValueError('Invalid remote score')
+                        remote_ok += count
+                        extracted_fraction = (offset + duration) / remaining_duration
+                        await prepared.put((None, remote_scores))
+                        offset += duration
+                        continue
+                    except Exception:
+                        # Do not log exception text: httpx errors contain the
+                        # request URL, and source capabilities are credentials.
+                        logger.warning('Remote extraction failed; retrying local extraction')
+                        remote_fallback += max(1, round(duration / frame_interval_seconds))
                 tmp = tempfile.TemporaryDirectory()
                 owned_dirs.append(tmp)
                 async def extraction_progress(fraction):
                     nonlocal extracted_fraction
                     extracted_fraction = (offset + fraction * duration) / remaining_duration
                     await report(f"Extracting chunk {number + 1}/{chunk_count}")
-                await _extract_frames_continuous(
-                    ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
-                    on_extract_progress=extraction_progress,
-                    start_offset=effective_start_offset + offset, clip_duration=duration,
-                )
+                async def extract():
+                    await _extract_frames_continuous(
+                        ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
+                        on_extract_progress=extraction_progress,
+                        start_offset=effective_start_offset + offset, clip_duration=duration,
+                    )
+                if remote_extract_enabled():
+                    # Remote scans bypass the outer heavy lock. A fallback
+                    # must rejoin audio/blur exclusion before touching NFS.
+                    from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
+                    async with HEAVY_PIPELINE_LOCK:
+                        await extract()
+                else:
+                    await extract()
                 extracted_fraction = (offset + duration) / remaining_duration
                 await prepared.put((tmp, effective_start_offset + offset))
                 offset += duration
@@ -530,6 +572,18 @@ async def _scan_frames(
                 logger.warning('Chunk extraction failed: %s', item)
                 break
             tmp, chunk_abs_start = item
+            if tmp is None:
+                for raw in chunk_abs_start:
+                    score = FrameScore(timestamp=float(raw['t']), confidence=float(raw['c']))
+                    async with progress_lock:
+                        scores.append(score)
+                        if resume_scores_path is not None:
+                            with resume_scores_path.open('a') as fh:
+                                fh.write(json.dumps({'t': score.timestamp, 'c': score.confidence}) + '\n')
+                    completed_overall += 1
+                    await report(f"Classifying {already_done_units + completed_overall}/{expected_total} frames")
+                slots.release()
+                continue
             frames = list(enumerate(sorted(Path(tmp.name).glob('frame_*.jpg'))))
             batch_size = 12 if _classifier_urls() else 1
             await asyncio.gather(*(classify_batch(frames[i:i + batch_size], chunk_abs_start)
