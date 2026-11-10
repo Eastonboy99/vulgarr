@@ -1698,11 +1698,14 @@ async def build_blurred_video(
                             stage_msg = f"Blurring scene {scenes_done + 1}/{total_scene_count}"
                         scenes_done += n
                         if on_stage is not None:
-                            await on_stage(stage_msg)
-                        await _extract_reencode_segment(
+                            mode = 'NVENC attempt / CPU fallback' if os.getenv('SPF_REMOTE_ENCODE_URL') else 'CPU'
+                            await on_stage(f"{stage_msg.replace('Blurring', 'Re-encoding')} ({mode})")
+                        backend = await _extract_reencode_segment(
                             ffmpeg_bin, video_path, segment, video_crf, video_preset, blur_radius, blur_power, seg_ts_path,
                             source_codec=video_codec,
                         )
+                        if on_stage is not None:
+                            await on_stage(f"Re-encoded scene {scenes_done}/{total_scene_count} ({backend or 'CPU'})")
                         done_reencode_seconds += segment.duration
                         if on_progress is not None:
                             await on_progress(min(1.0, done_reencode_seconds / total_reencode_seconds))
@@ -1713,6 +1716,10 @@ async def build_blurred_video(
                         # -- normalize it into a separate file so "the normalized
                         # file exists" stays a reliable resume-completion signal
                         # independent of the raw one.
+                        if on_stage is not None:
+                            copy_index = sum(not s.reencode for s in segments[:i + 1])
+                            copy_total = sum(not s.reencode for s in segments)
+                            await on_stage(f"Copy segment {copy_index}/{copy_total}")
                         raw_ts_path = tmp_root / f"copy_{i:04d}.mkv"
                         seg_ts_path = tmp_root / f"copy_{i:04d}_fixed.mkv"
                         if not seg_ts_path.exists():
