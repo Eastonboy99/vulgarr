@@ -3,6 +3,7 @@
   <div class="toolbar">
     <h1>Queue</h1>
   </div>
+  <div id="worker-status" hx-get="/queue/workers" hx-trigger="load" hx-swap="outerHTML"></div>
   <div hx-get="/queue/partial" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "partials/queue_table.html" %}
   </div>

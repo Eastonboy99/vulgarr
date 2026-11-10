@@ -1,0 +1,11 @@
+<section id="worker-status" class="card" hx-get="/queue/workers" hx-trigger="load delay:5s" hx-swap="outerHTML">
+  <h3>Remote workers</h3>
+  {% for worker in workers %}
+    <div><code>{{ worker.url }}</code>
+      <span class="badge badge-{{ 'done' if worker.online else 'failed' }}">{{ 'online' if worker.online else 'offline' }}</span>
+      {% if worker.online %}
+        {{ worker.device }} · {{ worker.requests_served }} requests · {{ worker.avg_latency_ms | round(1) }} ms average
+      {% endif %}
+    </div>
+  {% else %}<p class="muted">No remote workers configured.</p>{% endfor %}
+</section>
