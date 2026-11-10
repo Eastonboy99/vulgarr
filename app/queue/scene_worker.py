@@ -19,6 +19,8 @@ from app.db.models import JobState, SceneJob, SceneJobKind, Title
 from app.db.session import get_session, get_setting
 from app.mux.tempfiles import sweep_interrupted_temp_files
 from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
+from contextlib import nullcontext
+from app.vision.remote_source import remote_extract_enabled
 from app.queue.worker import is_within_off_hours_window
 from app.scenes.pipeline import apply_scene_blur, reverify_scenes_with_claude, scan_for_scenes
 
@@ -396,7 +398,9 @@ class SceneJobQueue:
 
             try:
                 if is_scan:
-                    async with HEAVY_PIPELINE_LOCK:
+                    # Local fallback reacquires the gate around extraction;
+                    # audio and blur still retain whole-pipeline exclusion.
+                    async with (nullcontext() if remote_extract_enabled() else HEAVY_PIPELINE_LOCK):
                         scan_outcome = await scan_for_scenes(
                             session, title, job.id, on_progress=on_scan_progress, on_stage=on_scan_stage
                         )
