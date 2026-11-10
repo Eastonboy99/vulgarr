@@ -40,7 +40,15 @@ def remove_orphaned_temp_files(video_path: Path, *, min_age_seconds: float = STA
     except OSError:
         return removed
     for path in entries:
-        if not path.name.startswith(prefixes) or path.suffix != video_path.suffix:
+        # Dense AV intermediates always use Matroska, even for MP4 sources.
+        # Restrict this exception to the exact title's interleave namespace.
+        interleave_temp = (
+            path.name.startswith(f'.{video_path.stem}.spf-blur-tmp.interleave-')
+            and path.suffix == '.mkv'
+        )
+        if not interleave_temp and (
+            not path.name.startswith(prefixes) or path.suffix != video_path.suffix
+        ):
             continue
         try:
             # Zero means no age guard (startup recovery), including files

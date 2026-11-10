@@ -70,6 +70,7 @@ from app.common.intervals import merge_intervals
 from app.mux.remux import (
     ProgressCallback,
     RemuxError,
+    MuxResourceError,
     StageCallback,
     _audio_streams,
     _run,
@@ -77,6 +78,8 @@ from app.mux.remux import (
     probe,
 )
 from app.mux.tempfiles import remove_orphaned_temp_files
+from app.mux.interleave import PacketInterleaveError, verify_packet_interleaving
+from app.mux.finalize import mux_interleaved_output
 
 logger = logging.getLogger(__name__)
 
@@ -1847,6 +1850,7 @@ async def build_blurred_video(
             video_path=video_path,
             concatenated_video_path=concatenated_video_path,
             concatenated_audio_path=concatenated_audio_path,
+            ffprobe_bin=ffprobe_bin,
             **({'audio_source_path': audio_source_path} if audio_source_path is not None else {}),
             audio_streams=audio_streams,
             out_path=tmp_path,
@@ -1872,57 +1876,23 @@ async def _mux_final_output(
     audio_source_path: Path | None = None,
     out_path: Path,
     timeout: float,
+    ffprobe_bin: str = 'ffprobe',
 ) -> None:
-    """Combines the already-fully-processed concatenated video (input 0, pure
-    stream-copy here -- all the real encoding work already happened per-segment)
-    with the original source's subtitles/chapters/metadata (input 1) and audio.
-    An external-library clean audio master may replace original audio (input
-    2) without changing where video, subtitles, or metadata come from.
+    """Losslessly interleave dense AV before restoring original sparse streams.
 
-    Audio comes from wherever it was actually processed: concatenated_audio_path
-    (input 2, already fully muted+copied+concatenated by the split pipeline in
-    build_blurred_video, see plan_audio_segments) when there was anything to
-    mute, or directly from the original (input 1) with a plain -c:a copy when
-    there wasn't -- both cases are pure stream-copy by the time this runs,
-    this function does no audio encoding itself either way."""
-    map_args = ["-map", "0:v:0"]
-    codec_args = ["-c:v", "copy"]
-
-    inputs = [concatenated_video_path, video_path]
-    if concatenated_audio_path is not None or audio_source_path is not None:
-        audio_input_index = 2
-        inputs.append(concatenated_audio_path or audio_source_path)
-    else:
-        audio_input_index = 1
-    for i in range(len(audio_streams)):
-        map_args += ["-map", f"{audio_input_index}:a:{i}"]
-        codec_args += [f"-c:a:{i}", "copy"]
-
-    # Subtitles/chapters/metadata always come from the original (index 1) --
-    # the concatenated .mkv video (index 0) and audio (index 2, if present)
-    # carry only their own stream types.
-    map_args += ["-map", "1:s?", "-map", "1:d?", "-map", "1:t?"]
-
-    cmd = [ffmpeg_bin, "-y", "-nostdin", "-loglevel", "error"]
-    for inp in inputs:
-        cmd += ["-i", str(inp)]
-    cmd += map_args + ["-map_metadata", "1", "-map_chapters", "1"] + codec_args + [
-        "-c:s", "copy",
-        # Plex's "Versions" picker shows auto-derived technical info (resolution/
-        # codec/container), not a custom label -- since this file matches the
-        # source on all of those, the picker alone can't tell them apart. These
-        # tags are a cheap attempt at a workaround (some clients surface
-        # embedded title metadata elsewhere in the UI), not a confirmed fix --
-        # -map_metadata above already copied the source's tags, so these,
-        # placed after, override just the "title" key.
-        "-metadata", "title=Vulgarr Edit",
-        "-metadata:s:v:0", "title=Vulgarr Edit",
-        str(out_path),
-    ]
-
-    code, _out, err = await _run(cmd, timeout=timeout)
-    if code != 0:
-        raise RemuxError(f"ffmpeg final mux failed for {video_path}: {err.strip()[-4000:]}")
+    Prefer scene-muted audio, then the external clean master, then original
+    audio. Explicit audio maps exclude the external cache's timing anchor.
+    The shared finalizer supervises memory and validates packet ordering without
+    re-encoding or adding corrective AV offsets. Existing duration/decode checks
+    still follow.
+    """
+    await mux_interleaved_output(
+        ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
+        video_path=concatenated_video_path,
+        audio_path=concatenated_audio_path or audio_source_path or video_path,
+        metadata_path=video_path, audio_count=len(audio_streams),
+        out_path=out_path, timeout=timeout,
+    )
 
 
 async def verify_blurred_output(
@@ -1947,6 +1917,8 @@ async def verify_blurred_output(
     new_duration = float(new_probe["format"].get("duration", 0))
     if orig_duration and abs(orig_duration - new_duration) > 2.0:
         raise RemuxError(f"Duration mismatch for {tmp_path}: original={orig_duration:.1f}s new={new_duration:.1f}s")
+
+    await verify_packet_interleaving(ffprobe_bin, tmp_path)
 
     # Decode a window spanning EVERY blurred scene, not just the first --
     # a real bug shipped past an earlier version of this check that only
@@ -2066,7 +2038,9 @@ async def apply_blur(
 
     try:
         tmp_path = await _build_and_verify(force_whole_file_video=False)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, PacketInterleaveError, MuxResourceError):
+        # Encoding the same movie again cannot repair mux resource/layout
+        # failures. Preserve intermediates and the previous published edit.
         raise
     except Exception as exc:
         logger.warning(

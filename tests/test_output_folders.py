@@ -213,7 +213,14 @@ def test_final_mux_uses_cached_audio_and_original_metadata(monkeypatch, tmp_path
     async def command(cmd, **kwargs):
         commands.append(cmd)
         return 0, '', ''
-    monkeypatch.setattr(scene_blur, '_run', command)
+    from app.mux import finalize
+    async def checked(*args):
+        pass
+    async def source_probe(*args):
+        return {'streams': [{'codec_type': 'subtitle'}, {'codec_type': 'attachment'}]}
+    monkeypatch.setattr(finalize, '_run', command)
+    monkeypatch.setattr(finalize, 'probe', source_probe)
+    monkeypatch.setattr(finalize, 'verify_packet_interleaving', checked)
     from app.mux.remux import _audio_streams
     real_audio = _audio_streams({'streams': [{'codec_type': 'audio'}, {'codec_type': 'audio'},
         {'codec_type': 'audio', 'tags': {'VULGARR_TIMING_ANCHOR': '1'}}]})
@@ -224,10 +231,15 @@ def test_final_mux_uses_cached_audio_and_original_metadata(monkeypatch, tmp_path
         out_path=tmp_path/'output.mkv', timeout=30))
     cmd = commands[0]
     assert [cmd[i+1] for i, item in enumerate(cmd) if item == '-i'] == [
-        str(tmp_path/'blurred.mkv'), str(tmp_path/'original.mkv'), str(tmp_path/'clean.mka')]
-    assert '2:a:0' in cmd and '2:a:1' in cmd
-    assert '2:a:2' not in cmd  # The timing-only anchor must never leave the cache.
-    assert '1:s?' in cmd and cmd[cmd.index('-map_metadata')+1] == '1'
+        str(tmp_path/'blurred.mkv'), str(tmp_path/'clean.mka')]
+    assert '1:a:0' in cmd and '1:a:1' in cmd
+    assert '1:a:2' not in cmd  # The timing-only anchor must never leave the cache.
+    assert cmd[cmd.index('-max_interleave_delta')+1] == '0'
+    final = commands[1]
+    assert '1:s?' in final and final[final.index('-map_metadata')+1] == '1'
+    assert final[final.index('-max_interleave_delta')+1] == '1000000'
+    assert '0:a:0' in final and '0:a:1' in final
+    assert [final[i+1] for i, item in enumerate(final) if item == '-i'][1] == str(tmp_path/'original.mkv')
 
 
 class FakeSession:

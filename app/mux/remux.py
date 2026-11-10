@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import psutil
+
 from app.audio.mute import MuteInterval, build_volume_filter
 from app.domain import Severity
 from app.mux.tempfiles import remove_orphaned_temp_files
@@ -38,6 +40,10 @@ class RemuxError(RuntimeError):
     pass
 
 
+class MuxResourceError(RemuxError):
+    """Buffering cannot safely continue; re-encoding video will not fix this."""
+
+
 @dataclass(frozen=True)
 class RemuxResult:
     output_path: Path
@@ -46,22 +52,66 @@ class RemuxResult:
     clean_track_indices: list[int]  # 0-based audio-stream indices of the new tracks, in canonical order
 
 
-async def _run(cmd: list[str], timeout: float | None = None) -> tuple[int, str, str]:
+async def _watch_rss(proc, limit: int) -> None:
+    """Abort a buffering mux rather than let sparse/damaged inputs exhaust RAM.
+
+    Poll resident memory on both Linux and Windows. The limit is an operational
+    guard, not a hard OS allocation limit: a child can overshoot between polls.
+    Fail closed if a running child cannot be inspected.
+    """
+    while proc.returncode is None:
+        try:
+            rss = psutil.Process(proc.pid).memory_info().rss
+        except psutil.NoSuchProcess:
+            return
+        except psutil.Error as exc:
+            raise MuxResourceError('Cannot monitor interleave mux memory') from exc
+        if rss > limit:
+            raise MuxResourceError(
+                f'Interleave mux exceeded its {limit // (1024 * 1024)} MiB memory budget; '
+                'previous output has not been replaced'
+            )
+        await asyncio.sleep(0.1)
+
+
+async def _run(
+    cmd: list[str], timeout: float | None = None, *, max_rss_bytes: int | None = None,
+) -> tuple[int, str, str]:
+    """Run a child with timeout/cancellation cleanup and optional RSS supervision."""
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
+    communication = asyncio.create_task(proc.communicate())
+    watcher = asyncio.create_task(_watch_rss(proc, max_rss_bytes)) if max_rss_bytes else None
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RemuxError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
-    except asyncio.CancelledError:
-        # Awaiting proc.communicate() being cancelled does not kill the child
-        # process on its own -- without this it would keep running as an orphan.
-        proc.kill()
-        await proc.wait()
+        if watcher is None:
+            stdout, stderr = await asyncio.wait_for(communication, timeout=timeout)
+        else:
+            results = await asyncio.wait_for(
+                asyncio.gather(communication, watcher), timeout=timeout
+            )
+            stdout, stderr = results[0]
+    except BaseException as exc:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        # A cancelled communicate() can leave full pipe buffers. Stop its
+        # readers before draining again; wait() alone can deadlock on exit.
+        if not communication.done():
+            communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+        await proc.communicate()
+        if isinstance(exc, asyncio.TimeoutError):
+            raise RemuxError(f"Command timed out after {timeout}s: {' '.join(cmd)}") from exc
         raise
+    finally:
+        tasks = [communication] + ([watcher] if watcher is not None else [])
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 

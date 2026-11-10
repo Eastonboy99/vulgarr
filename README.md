@@ -160,6 +160,52 @@ mocked ffmpeg. Validate one audio-only and one combined audio/scene edit on real
 media after deployment, including audio sync on delayed-audio sources,
 re-running audio and changing scene approvals.
 
+### Plex-compatible scene-edit interleaving
+
+Scene-edit publication uses two **lossless stream-copy** passes. The first
+interleaves the processed video and real audio tracks with early queue flushing
+disabled. The second reads that AV together and restores original subtitles,
+data streams, attachments, chapters, and metadata using a finite flush interval.
+Sparse subtitle gaps therefore do not hold the entire movie in the zero-flush
+queue. Audio titles, languages, dispositions, and attachment MIME/filename tags
+are retained explicitly. Existing codec/HEVC splice and decode checks still run.
+
+This fixes a reproduced edit whose third video packet occurred after 156 MB of
+audio: Plex could encode frames but produced abnormal DASH fragmentation and
+hung during playback attempts. A lossless AV repair restored the user's Plex
+transcoder test to normal throughput; it does not require changing bit depth,
+video codec, or GPU settings.
+
+The AV pass temporarily needs **one additional full AV copy on the output
+filesystem**. Both mux passes have a **1 GiB child-process RSS watchdog** (not a
+hard allocation limit); a damaged/delayed track that exceeds the budget fails
+without replacing the previous edit. Timeout/cancellation kills and reaps the
+child. Hidden AV intermediates use the existing per-title orphan-sweep namespace
+so interrupted runs do not leave permanent full-movie copies.
+
+Before publication, bounded packet probes sample the beginning, middle, and end
+(up to 3,000 packets per sample). Audio leading encountered video by more than
+five seconds is rejected. This is a sampled layout safeguard, not a full-file
+playback guarantee. Layout/resource failures do not trigger an expensive video
+re-encode retry; genuine segment/decode failures retain whole-file recovery.
+
+Rebuild the **Vulgarr server image** for this fix; worker daemons need no changes.
+Existing published files are not silently rewritten: **Apply scenes** again to
+regenerate an affected edit, then refresh Plex metadata and test Chrome playback.
+Interrupted-job render intermediates can still be reused; completed jobs normally
+remove theirs, so a fresh Apply may render again. Scan scores and approvals are
+not invalidated by this mux-only change.
+
+Opt-in synthetic media qualification (does not restart or modify worker services):
+
+```bash
+SPF_TEST_RENDER_CONTAINERS=worker-0,worker-1 python -m pytest tests/test_interleave_media.py -q
+```
+
+It covers H.264, HEVC 8/10-bit, sparse subtitles, attachments, chapters, delayed
+7.1/stereo audio, and unchanged decoded video. Real affected-media Chrome/HDR
+qualification remains a deployment check.
+
 ## Remote GPU workers (this fork)
 
 See [remote_worker/README.md](remote_worker/README.md) for batch inference,
