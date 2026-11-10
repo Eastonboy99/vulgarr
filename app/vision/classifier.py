@@ -14,6 +14,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -314,6 +315,7 @@ async def _scan_frames(
     start_offset: float = 0.0,
     clip_duration: float | None = None,
     resume_scores_path: Path | None = None,
+    on_status=None,
 ) -> list[FrameScore]:
     """Shared implementation behind scan_video_frames (whole file) and
     scan_window_frames (one short padded clip) -- extract via one continuous
@@ -419,112 +421,152 @@ async def _scan_frames(
     # "all extraction, ever," not "this chunk's share").
     extraction_seconds_done = 0.0
 
-    chunk_start = 0.0
-    while chunk_start < remaining_duration - 1e-6:
-        this_chunk_duration = min(chunk_size, remaining_duration - chunk_start)
-        chunk_abs_start = effective_start_offset + chunk_start
-        chunk_prior_extraction_seconds = extraction_seconds_done  # snapshot before this chunk's own extraction
+    # A bounded producer owns tempdirs until the consumer has checkpointed
+    # their frames. Two slots mean exactly current + next, not an unbounded
+    # decode backlog on a fast disk / slow inference box. Cancellation joins
+    # the producer before deleting its files (including ffmpeg cancellation).
+    prepared = asyncio.Queue()
+    slots = asyncio.Semaphore(2)
+    owned_dirs = []
+    chunk_count = max(1, __import__('math').ceil(remaining_duration / chunk_size))
+    extracted_fraction = 0.0
+    remote_ok = remote_fallback = in_flight = 0
+    started = time.monotonic()
+    progress_high_water = already_done_units
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_dir = Path(tmpdir)
+    async def report(phase):
+        nonlocal progress_high_water
+        async with progress_lock:
+            done = already_done_units + round(extracted_fraction * extract_units) + round(
+                completed_overall / total_frames_remaining * classify_units
+            )
+            progress_high_water = max(progress_high_water, min(done, expected_total))
+            if on_status is not None:
+                fps = completed_overall / max(0.001, time.monotonic() - started)
+                await on_status(f"{phase} · remote {remote_ok} · fallback {remote_fallback} · {fps:.1f} fps · {in_flight} in flight")
+            if on_progress is not None:
+                await on_progress(progress_high_water, expected_total)
 
-            async def on_extract_progress(fraction: float) -> None:
-                if on_progress is not None:
-                    seconds_done = chunk_prior_extraction_seconds + fraction * this_chunk_duration
-                    frac_of_remaining = seconds_done / remaining_duration if remaining_duration else 0.0
-                    done = already_done_units + round(frac_of_remaining * extract_units)
-                    await on_progress(min(done, expected_total), expected_total)
-
-            try:
+    async def produce():
+        nonlocal extracted_fraction
+        offset = 0.0
+        try:
+            for number in range(chunk_count):
+                await slots.acquire()
+                duration = min(chunk_size, remaining_duration - offset)
+                tmp = tempfile.TemporaryDirectory()
+                owned_dirs.append(tmp)
+                async def extraction_progress(fraction):
+                    nonlocal extracted_fraction
+                    extracted_fraction = (offset + fraction * duration) / remaining_duration
+                    await report(f"Extracting chunk {number + 1}/{chunk_count}")
                 await _extract_frames_continuous(
-                    ffmpeg_bin, video_path, frame_interval_seconds, out_dir, this_chunk_duration,
-                    on_extract_progress=on_extract_progress, start_offset=chunk_abs_start,
-                    clip_duration=this_chunk_duration,
+                    ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
+                    on_extract_progress=extraction_progress,
+                    start_offset=effective_start_offset + offset, clip_duration=duration,
                 )
-            except Exception:
-                logger.warning(
-                    "Continuous frame extraction failed for %s at +%.1fs -- scan yields what's already checkpointed",
-                    video_path, chunk_abs_start, exc_info=True,
-                )
-                return scores
+                extracted_fraction = (offset + duration) / remaining_duration
+                await prepared.put((tmp, effective_start_offset + offset))
+                offset += duration
+        except Exception as exc:
+            await prepared.put(exc)
+        finally:
+            await prepared.put(None)
 
-            extraction_seconds_done += this_chunk_duration
-            extract_frac_so_far = extraction_seconds_done / remaining_duration if remaining_duration else 0.0
-            extract_done_units_so_far = round(extract_frac_so_far * extract_units)
-
-            frame_files = sorted(out_dir.glob("frame_*.jpg"))
-
-            async def classify_one(index: int, frame_path: Path) -> None:
-                nonlocal completed_overall
-                # fps=1/interval numbers frames from 1 -- frame N was sampled at
-                # roughly (N-1)*interval seconds into this chunk, plus
-                # chunk_abs_start to map back onto the real file's timeline.
-                ts = chunk_abs_start + index * frame_interval_seconds
-                score: FrameScore | None = None
-                async with semaphore:
+    async def classify_batch(items, chunk_abs_start):
+        nonlocal completed_overall, remote_ok, remote_fallback, in_flight
+        async with semaphore:
+            in_flight += 1
+            try:
+                results = None
+                urls = _classifier_urls()
+                if urls:
                     try:
-                        detections = await _detect(frame_path, _local_detect)
-                        score = FrameScore(timestamp=ts, confidence=frame_confidence(detections))
-                        scores.append(score)
-                    except Exception:
-                        logger.warning(
-                            "Scene-scan frame classification failed at %.2fs in %s", ts, video_path, exc_info=True
+                        url = urls[next(_remote_rr) % len(urls)]
+                        response = await _remote_http_client().post(
+                            f"{url}/detect-batch",
+                            files=[('frames', (p.name, p.read_bytes(), 'image/jpeg')) for _, p in items],
                         )
+                        response.raise_for_status()
+                        results = response.json()['detections']
+                        if not isinstance(results, list) or len(results) != len(items) or any(not isinstance(r, list) for r in results):
+                            raise ValueError('incomplete batch response')
+                        # Validate before trusting any part of the response.
+                        for result in results:
+                            frame_confidence(result)
+                        remote_ok += len(items)
+                    except Exception:
+                        logger.warning('Batch classifier failed; retrying individual frames', exc_info=True)
+                        results = None
+                for position, (index, path) in enumerate(items):
+                    ts = chunk_abs_start + index * frame_interval_seconds
+                    try:
+                        if results is None:
+                            detections = await _detect(path, _local_detect)
+                            if urls:
+                                remote_fallback += 1
+                        else:
+                            detections = results[position]
+                        score = FrameScore(timestamp=ts, confidence=frame_confidence(detections))
+                        async with progress_lock:
+                            scores.append(score)
+                            if resume_scores_path is not None:
+                                with resume_scores_path.open('a') as fh:
+                                    fh.write(json.dumps({'t': ts, 'c': score.confidence}) + '\n')
+                    except Exception:
+                        logger.warning('Scene frame failed at %.2fs', ts, exc_info=True)
                     completed_overall += 1
-                    async with progress_lock:
-                        if resume_scores_path is not None and score is not None:
-                            with resume_scores_path.open("a") as fh:
-                                fh.write(json.dumps({"t": score.timestamp, "c": score.confidence}) + "\n")
-                        if on_progress is not None:
-                            done = already_done_units + extract_done_units_so_far + round(
-                                completed_overall / total_frames_remaining * classify_units
-                            )
-                            await on_progress(min(done, expected_total), expected_total)
+                    await report(f"Classifying {already_done_units + completed_overall}/{expected_total} frames")
+            finally:
+                in_flight -= 1
 
-            if frame_files:
-                await asyncio.gather(*(classify_one(i, f) for i, f in enumerate(frame_files)))
-
-        chunk_start += this_chunk_duration
-
+    producer = asyncio.create_task(produce())
+    try:
+        while True:
+            item = await prepared.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                logger.warning('Chunk extraction failed: %s', item)
+                break
+            tmp, chunk_abs_start = item
+            frames = list(enumerate(sorted(Path(tmp.name).glob('frame_*.jpg'))))
+            batch_size = 12 if _classifier_urls() else 1
+            await asyncio.gather(*(classify_batch(frames[i:i + batch_size], chunk_abs_start)
+                                   for i in range(0, len(frames), batch_size)))
+            tmp.cleanup()
+            owned_dirs.remove(tmp)
+            slots.release()
+    finally:
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+        for tmp in owned_dirs:
+            tmp.cleanup()
     return scores
 
 
 async def scan_video_frames(
-    video_path: Path,
-    ffmpeg_bin: str,
-    duration_seconds: float,
-    frame_interval_seconds: float,
-    on_progress=None,
-    concurrency: int = 1,
-    resume_scores_path: Path | None = None,
+    video_path: Path, ffmpeg_bin: str, duration_seconds: float,
+    frame_interval_seconds: float, on_progress=None, concurrency: int = 1,
+    resume_scores_path: Path | None = None, on_status=None,
 ) -> list[FrameScore]:
-    """Sample the whole file every frame_interval_seconds. See _scan_frames for
-    the shared implementation. resume_scores_path, when given, makes this
-    resumable across a process restart -- see _scan_frames' own docstring."""
+    """Sample the whole title, preserving the contiguous resume prefix."""
     return await _scan_frames(
         video_path, ffmpeg_bin, frame_interval_seconds, duration_seconds,
-        on_progress=on_progress, concurrency=concurrency, resume_scores_path=resume_scores_path,
+        on_progress=on_progress, concurrency=concurrency,
+        resume_scores_path=resume_scores_path, on_status=on_status,
     )
 
 
 async def scan_window_frames(
-    video_path: Path,
-    ffmpeg_bin: str,
-    window_start: float,
-    window_end: float,
-    pad_seconds: float,
-    frame_interval_seconds: float,
-    concurrency: int = 1,
+    video_path: Path, ffmpeg_bin: str, window_start: float, window_end: float,
+    pad_seconds: float, frame_interval_seconds: float, concurrency: int = 1,
 ) -> list[FrameScore]:
-    """Densely re-sample just one candidate scene's padded window -- a stronger
-    per-scene confidence signal than the initial full-file scan's coarser
-    sampling gives (see verified_fraction in scene_cluster.py), and cheap
-    because it's a single short clip instead of the whole movie. Reuses the
-    same continuous-decode approach as scan_video_frames, just scoped via
-    start_offset/clip_duration to a few seconds of source."""
+    """Densely sample a padded candidate window on the source timeline."""
     clip_start = max(0.0, window_start - pad_seconds)
     clip_duration = (window_end - window_start) + 2 * pad_seconds
     return await _scan_frames(
         video_path, ffmpeg_bin, frame_interval_seconds, clip_duration,
         concurrency=concurrency, start_offset=clip_start, clip_duration=clip_duration,
     )
+

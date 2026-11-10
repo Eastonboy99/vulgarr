@@ -315,6 +315,7 @@ class SceneJobQueue:
 
             job_start_monotonic = time.monotonic()
             last_update_monotonic = 0.0
+            scan_phase = "Scanning for scenes"
 
             async def on_scan_progress(done: int, total: int) -> None:
                 nonlocal last_update_monotonic
@@ -327,7 +328,7 @@ class SceneJobQueue:
                 last_update_monotonic = now
                 fraction = done / total
                 job.progress_percent = round(100 * fraction, 1)
-                message = f"Scanning for scenes -- frame {done}/{total}"
+                message = scan_phase
                 if fraction > 0 and not is_final:
                     elapsed = now - job_start_monotonic
                     eta_seconds = elapsed * (1 - fraction) / fraction
@@ -368,6 +369,10 @@ class SceneJobQueue:
                 await session.commit()
 
             async def on_scan_stage(message: str) -> None:
+                nonlocal scan_phase
+                scan_phase = message
+                if message.startswith(("Extracting chunk", "Classifying ")):
+                    return  # The paired progress callback throttles database writes.
                 # No progress-percent bump like on_blur_stage's 97% floor -- the
                 # frame-count progress above already reaches 100% once the main
                 # scan finishes, so the per-candidate verification pass that

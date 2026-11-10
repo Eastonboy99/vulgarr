@@ -205,6 +205,7 @@ async def scan_for_scenes(
         on_progress=on_progress,
         concurrency=frame_concurrency,
         resume_scores_path=resume_scores_path,
+        on_status=on_stage,
     )
 
     candidates = cluster_scenes(
