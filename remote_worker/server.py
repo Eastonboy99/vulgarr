@@ -44,7 +44,15 @@ def detector() -> NudeDetector:
         with _load_lock:
             det = _cache.get("det")
             if det is None:
-                det = NudeDetector()
+                # NudeNet 3.4.2 has the providers argument commented out in
+                # NudeDetector.__init__, so an un-requested session silently
+                # lands on CPU even in onnxruntime-gpu builds. Request CUDA
+                # explicitly (falling back to CPU-only if CUDA is unavailable,
+                # e.g. a CPU-only worker box).
+                try:
+                    det = NudeDetector(providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                except Exception:
+                    det = NudeDetector()
                 _cache["det"] = det
     return det
 
