@@ -649,6 +649,22 @@
       }
     }
 
+    // Remember only disclosure state, not the disclosure DOM: hx-preserve
+    // would also freeze new candidates/verdicts inside a polling title card.
+    // Like settings state below, restore globally rather than relying on a
+    // script embedded in a partial executing again after every htmx swap.
+    const disclosureState = new Map();
+    document.addEventListener("htmx:beforeSwap", function () {
+      document.querySelectorAll("details[data-remember-open][id]").forEach(function (node) {
+        disclosureState.set(node.id, node.open);
+      });
+    });
+    document.addEventListener("htmx:afterSwap", function () {
+      document.querySelectorAll("details[data-remember-open][id]").forEach(function (node) {
+        if (disclosureState.has(node.id)) node.open = disclosureState.get(node.id);
+      });
+    });
+
     // Settings page's "Show advanced settings" toggle -- state remembered in
     // localStorage. Applied via a global htmx:afterSettle listener rather than
     // an inline <script> inside settings_form.html, since that partial gets
