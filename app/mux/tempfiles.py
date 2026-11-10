@@ -43,7 +43,10 @@ def remove_orphaned_temp_files(video_path: Path, *, min_age_seconds: float = STA
         if not path.name.startswith(prefixes) or path.suffix != video_path.suffix:
             continue
         try:
-            if path.stat().st_mtime > cutoff:
+            # Zero means no age guard (startup recovery), including files
+            # whose mtime is ahead of this clock due to Windows precision or
+            # network-share clock skew. Positive ages still protect live jobs.
+            if min_age_seconds > 0 and path.stat().st_mtime > cutoff:
                 continue
             path.unlink()
         except OSError:

@@ -42,6 +42,15 @@ def test_min_age_zero_removes_recent_temp(tmp_path):
     assert remove_orphaned_temp_files(video, min_age_seconds=0) == [tmp]
 
 
+def test_zero_age_ignores_future_mtime_but_default_guard_preserves_it(tmp_path):
+    video = _touch(tmp_path / 'Movie.mkv')
+    future_tmp = _touch(tmp_path / '.Movie.spf-tmp.abcd1234.mkv', age_seconds=-60)
+    assert remove_orphaned_temp_files(video) == []
+    assert future_tmp.exists()
+    assert remove_orphaned_temp_files(video, min_age_seconds=0) == [future_tmp]
+    assert video.exists()
+
+
 def test_never_touches_other_titles_edits_or_unrelated_files(tmp_path):
     video = _touch(tmp_path / "Show - S01E01.mkv")
     keep = [
