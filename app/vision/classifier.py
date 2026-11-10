@@ -7,16 +7,67 @@ scans for scenes pays zero import/model-load cost for this being available.
 """
 
 import asyncio
+import itertools
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
 
+import httpx
+
 from app.vision.scene_cluster import FrameScore
 
 logger = logging.getLogger(__name__)
+
+# --- Remote GPU classifier (DockerStacks patch) ---------------------------------
+# SPF_CLASSIFIER_URLS: comma-separated http://host:port list of remote NudeNet
+# workers (see downloadstation/vulgarr-worker). When set, every frame is sent
+# over HTTP for GPU inference instead of running locally on CPU; on any remote
+# failure (worker down, timeout, bad response) we transparently fall back to
+# the original local CPU path so a powered-off desktop never breaks a scan.
+# Frames are distributed round-robin across the listed URLs (e.g. one worker
+# per GPU on the same desktop).
+
+def _classifier_urls() -> list[str]:
+    raw = os.environ.get("SPF_CLASSIFIER_URLS", "")
+    return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+
+
+_remote_rr = itertools.count()
+_remote_client: httpx.AsyncClient | None = None
+_remote_client_lock = threading.Lock()
+
+
+def _remote_http_client() -> httpx.AsyncClient:
+    global _remote_client
+    with _remote_client_lock:
+        if _remote_client is None:
+            _remote_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+        return _remote_client
+
+
+async def _detect(frame_path: Path, local_detector_callable) -> list[dict]:
+    """Classify one frame: remote GPU worker if configured, else (or on any
+    remote failure) the local CPU NudeNet session. Always returns NudeNet's
+    raw per-frame detection list (possibly empty)."""
+    urls = _classifier_urls()
+    if urls:
+        url = urls[next(_remote_rr) % len(urls)]
+        try:
+            with frame_path.open("rb") as fh:
+                resp = await _remote_http_client().post(
+                    f"{url}/detect", files={"frame": (frame_path.name, fh, "image/jpeg")}
+                )
+            if resp.status_code == 200:
+                return resp.json().get("detections", [])
+            logger.warning("Remote classifier %s returned HTTP %d -- falling back to local", url, resp.status_code)
+        except Exception:
+            logger.warning("Remote classifier %s unreachable -- falling back to local CPU", url, exc_info=True)
+    return await asyncio.to_thread(local_detector_callable, str(frame_path))
+# --------------------------------------------------------------------------------
 
 # NudeNet's 18-class taxonomy includes body parts that are just anatomically
 # present in an ordinary frame (faces, feet, armpits, belly) alongside the
@@ -334,7 +385,17 @@ async def _scan_frames(
     # since its clips are already short enough not to need this.
     chunk_size = _SCAN_CHUNK_SECONDS if resume_scores_path is not None else remaining_duration
 
-    detector = _get_detector()
+    # Local detector is loaded lazily: when SPF_CLASSIFIER_URLS is set and the
+    # workers stay healthy, nudenet/onnxruntime is never imported on this host
+    # at all (patch: keeps the server CPU free during remote scans).
+    detector_holder: dict = {}
+
+    def _local_detect(path: str):
+        det = detector_holder.get("det")
+        if det is None:
+            det = _get_detector()
+            detector_holder["det"] = det
+        return det.detect(path)
     scores: list[FrameScore] = list(resumed_scores)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     # Callers' on_progress (see app.queue.scene_worker.on_scan_progress) commits
@@ -402,7 +463,7 @@ async def _scan_frames(
                 score: FrameScore | None = None
                 async with semaphore:
                     try:
-                        detections = await asyncio.to_thread(detector.detect, str(frame_path))
+                        detections = await _detect(frame_path, _local_detect)
                         score = FrameScore(timestamp=ts, confidence=frame_confidence(detections))
                         scores.append(score)
                     except Exception:

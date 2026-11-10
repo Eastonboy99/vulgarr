@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.32
+# Pinned to match vulgarr's upstream classifier exactly (requirements.txt)
+nudenet==3.4.2
+# GPU inference -- requires NVIDIA container runtime (see compose.yaml).
+# If CUDA is unavailable at runtime, NudeDetector still falls back to CPU EP,
+# so this worker can also run on any machine as a plain CPU offloader.
+onnxruntime-gpu==1.20.2
