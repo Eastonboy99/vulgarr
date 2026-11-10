@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+import json
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
@@ -7,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings as app_settings
 from app.db.models import DetectedScene, SceneJob, Title
@@ -15,6 +17,7 @@ from app.db.session import get_session, get_setting
 from app.domain import SceneJobKind, SceneReviewStatus
 from app.queue.scene_worker import scene_job_queue
 from app.scenes import scrub_proxy
+from app.scenes.content_policy import Action, CATEGORIES, VISUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
 from app.vision.classifier import extract_frame
 
 router = APIRouter(tags=["scenes"])
@@ -27,6 +30,16 @@ async def _scene_review_context(session, title_id: int) -> dict:
         select(DetectedScene).where(DetectedScene.title_id == title_id).order_by(DetectedScene.start_seconds)
     )
     scenes = scenes_result.scalars().all()
+    policy = await get_setting(session, "scene_content_policy")
+    render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
+    category_counts = {}
+    for scene in scenes:
+        scene.effective_decision = scene_decision(scene, policy)
+        evidence = json.loads(scene.category_evidence) if scene.category_evidence else None
+        scene.evidence_display = evidence
+        if evidence:
+            for category in evidence["labels"]:
+                category_counts[category] = category_counts.get(category, 0) + 1
     high_confidence_fraction = float(await get_setting(session, "scene_high_confidence_fraction"))
 
     # The most recent job for this title, whatever its state -- while it's still
@@ -78,18 +91,41 @@ async def _scene_review_context(session, title_id: int) -> dict:
 
     return {
         "title_id": title_id,
+        "scan_generation": str(title.scene_scan_generation or "") if title else "",
+        "category_counts": category_counts,
+        "category_labels": CATEGORIES,
+        "policy_stale": bool(title and title.vulgarr_edit_path and title.scene_policy_applied != policy_fingerprint(policy)),
+        "scene_set_stale": bool(title and title.vulgarr_edit_path and title.scene_set_applied != scene_set_fingerprint(scenes, policy, render_settings)),
+        "scene_analysis": json.loads(title.scene_analysis) if title and title.scene_analysis else None,
+        "needs_reanalysis": not (title and title.scene_analysis and set(json.loads(title.scene_analysis).get("coverage", [])) >= VISUAL_CATEGORIES),
+        "legacy_evidence": any(not s.category_evidence and s.source != "manual" for s in scenes),
         "scene_scan_status": title.scene_scan_status if title else "not_scanned",
         "scenes": scenes,
         "scan_job": scan_job,
         "blur_job": blur_job,
         "claude_verify_job": claude_verify_job,
-        "claude_vision_verify_enabled": bool(await get_setting(session, "claude_vision_verify_enabled")),
+        "claude_vision_verify_enabled": bool(await get_setting(session, "claude_vision_verify_enabled")) or bool(await get_setting(session, "scene_semantic_enabled")),
         "claude_reverifiable_count": claude_reverifiable_count,
         "vulgarr_edit_path": title.vulgarr_edit_path if title else None,
         "high_confidence_fraction": high_confidence_fraction,
         "pending_count": pending_count,
         "high_confidence_pending_count": high_confidence_pending_count,
     }
+
+
+async def _claim_review_generation(session, request: Request, title_id: int) -> bool:
+    """Fence title-wide stale forms and reserve the writer through review commit."""
+    form = await request.form()
+    raw = form.get("scan_generation", "")
+    try:
+        generation = int(raw) if raw else None
+    except (ValueError, TypeError):
+        return False
+    claimed = await session.execute(update(Title).where(
+        Title.id == title_id, Title.scene_scan_generation == generation,
+        Title.scene_scan_status.not_in(["queued", "scanning"]),
+    ).values(scene_scan_status=Title.scene_scan_status))
+    return bool(claimed.rowcount)
 
 
 async def _render_scene_review(request: Request, title_id: int, detail_view: bool = False) -> HTMLResponse:
@@ -167,21 +203,22 @@ async def scene_review_page(request: Request, title_id: int):
 
 
 @router.post("/library/title/{title_id}/scan-scenes", response_class=HTMLResponse)
-async def scan_scenes(request: Request, title_id: int, detail_view: bool = Form(False)):
-    await scene_job_queue.enqueue_scan_if_not_already_active(title_id)
+async def scan_scenes(request: Request, title_id: int, detail_view: bool = Form(False),
+                      keep_manual: bool = Form(False)):
+    await scene_job_queue.enqueue_scan(title_id, keep_manual=keep_manual)
     return await _render_scene_review(request, title_id, detail_view)
 
 
 @router.post("/library/title/{title_id}/reverify-scenes-claude", response_class=HTMLResponse)
 async def reverify_scenes_claude(request: Request, title_id: int, detail_view: bool = Form(False)):
-    """Manually re-runs the Claude Vision precision filter (see
-    app.scenes.pipeline.reverify_scenes_with_claude) against this title's existing
-    candidates -- for scenes scanned/auto-approved before claude_vision_verify_enabled
-    was turned on, which never got this check at scan time. The template only shows
-    the triggering button when the setting is on and there's at least one non-rejected
-    scene, but this endpoint doesn't re-check either -- enqueue_claude_verify_if_not_already_active
-    and reverify_scenes_with_claude both no-op harmlessly (an empty scene list, or an
-    unconfigured endpoint failing every candidate) if it's ever hit anyway."""
+    """Re-analyze existing windows with explicit external-analysis consent.
+
+    Structured clothing evidence never goes through the legacy yes/no prompt.
+    This is not a replacement for a whole-title scan when coverage is missing.
+    """
+    async with get_session() as session:
+        if not (await get_setting(session, "claude_vision_verify_enabled") or await get_setting(session, "scene_semantic_enabled")):
+            raise HTTPException(409, "External scene analysis must be explicitly enabled in Settings")
     await scene_job_queue.enqueue_claude_verify_if_not_already_active(title_id)
     return await _render_scene_review(request, title_id, detail_view)
 
@@ -200,6 +237,8 @@ async def apply_scenes(request: Request, title_id: int, detail_view: bool = Form
     applied_at from the prior run but the file still needs regenerating to
     drop the one that's no longer approved."""
     async with get_session() as session:
+        if not await _claim_review_generation(session, request, title_id):
+            return await _render_scene_review(request, title_id, detail_view)
         approved = await session.execute(
             select(DetectedScene).where(
                 DetectedScene.title_id == title_id,
@@ -207,7 +246,9 @@ async def apply_scenes(request: Request, title_id: int, detail_view: bool = Form
             )
         )
         has_approved = approved.first() is not None
-    if has_approved:
+        title = await session.get(Title, title_id)
+        has_published = bool(title and title.vulgarr_edit_path)
+    if has_approved or has_published:
         await scene_job_queue.enqueue_blur_if_not_already_active(title_id)
     return await _render_scene_review(request, title_id, detail_view)
 
@@ -357,19 +398,49 @@ async def reject_scene(
 async def toggle_scene_mute(
     request: Request, scene_id: int, title_id: int | None = Form(None), detail_view: bool = Form(False)
 ):
-    """Flips whether Apply also mutes audio for this scene, on top of always
-    blurring the video -- default off (see DetectedScene.mute_audio). Doesn't
-    touch status/reviewed_at -- this is independent of approve/reject, and can
-    be changed either before or after approving."""
+    """Create an explicit audio override by flipping the effective audio rule."""
     async with get_session() as session:
         scene = await session.get(DetectedScene, scene_id)
         resolved_title_id = scene.title_id if scene is not None else title_id
         if scene is not None:
-            scene.mute_audio = not scene.mute_audio
+            policy = await get_setting(session, "scene_content_policy")
+            scene.audio_override = not scene_decision(scene, policy).mute_audio
+            scene.mute_audio = scene.audio_override
             await session.commit()
     if resolved_title_id is None:
         return HTMLResponse("")
     return await _render_scene_review(request, resolved_title_id, detail_view)
+
+
+@router.post("/library/title/{title_id}/reset-scene-audio", response_class=HTMLResponse)
+async def reset_scene_audio(request: Request, title_id: int, detail_view: bool = Form(False)):
+    """Explicitly discard legacy/per-scene audio choices; never regenerate here."""
+    async with get_session() as session:
+        if not await _claim_review_generation(session, request, title_id):
+            return await _render_scene_review(request, title_id, detail_view)
+        result = await session.execute(select(DetectedScene).where(DetectedScene.title_id == title_id))
+        for scene in result.scalars():
+            scene.audio_override = None
+            scene.mute_audio = False
+        await session.commit()
+    return await _render_scene_review(request, title_id, detail_view)
+
+
+@router.post("/scenes/{scene_id}/action", response_class=HTMLResponse)
+async def set_scene_action(request: Request, scene_id: int, action: str = Form(...),
+                           title_id: int | None = Form(None), detail_view: bool = Form(False)):
+    """An explicit manual content action takes precedence over category policy."""
+    if action not in {"inherit", *(a.value for a in Action)}:
+        raise HTTPException(422, "Invalid scene action")
+    async with get_session() as session:
+        scene = await session.get(DetectedScene, scene_id)
+        resolved_title_id = scene.title_id if scene else title_id
+        if scene is not None:
+            scene.action_override = None if action == "inherit" else action
+            scene.audio_override = None if action == "inherit" else action == "blur_mute"
+            scene.mute_audio = bool(scene.audio_override)
+            await session.commit()
+    return await _render_scene_review(request, resolved_title_id, detail_view) if resolved_title_id else HTMLResponse("")
 
 
 @router.post("/library/title/{title_id}/approve-high-confidence", response_class=HTMLResponse)
@@ -379,6 +450,8 @@ async def approve_high_confidence_scenes(request: Request, title_id: int, detail
     -- the review-friction reducer for the clear-cut cases, while anything short/
     borderline enough to score low on that fraction still needs an actual look."""
     async with get_session() as session:
+        if not await _claim_review_generation(session, request, title_id):
+            return await _render_scene_review(request, title_id, detail_view)
         high_confidence_fraction = float(await get_setting(session, "scene_high_confidence_fraction"))
         result = await session.execute(
             select(DetectedScene).where(
@@ -402,6 +475,8 @@ async def approve_all_scenes(request: Request, title_id: int, detail_view: bool 
     -- the blunt version of approve-high-confidence above, for anyone who'd rather
     just approve everything a scan found than review one at a time."""
     async with get_session() as session:
+        if not await _claim_review_generation(session, request, title_id):
+            return await _render_scene_review(request, title_id, detail_view)
         result = await session.execute(
             select(DetectedScene).where(
                 DetectedScene.title_id == title_id,
@@ -646,8 +721,7 @@ async def add_manual_scenes(
 ):
     """Creates one already-approved scene per (start, end) pair. Approved from the
     start because the user marked these by hand -- there's nothing left to review,
-    and it keeps a later rescan (which only clears pending/rejected candidates)
-    from discarding them."""
+    and a fresh rescan replaces these windows unless Keep manual scenes is selected."""
     from app.mux.remux import probe
 
     duration = None
@@ -663,7 +737,7 @@ async def add_manual_scenes(
             duration = None
 
         now = datetime.datetime.utcnow()
-        # mutes is parallel to starts/ends ("1" = also mute audio for that clip); a short list means no mute.
+        # "1" explicitly forces mute; unchecked/missing inherits global audio.
         mute_flags = [m == "1" for m in mutes] + [False] * len(starts)
         for start, end, mute in zip(starts, ends, mute_flags):
             start = max(0.0, start)
@@ -673,11 +747,14 @@ async def add_manual_scenes(
                 continue
             session.add(
                 DetectedScene(
+                    id=secrets.randbits(62) + 1,
                     title_id=title_id,
+                    scan_generation=title.scene_scan_generation,
                     start_seconds=start,
                     end_seconds=end,
                     peak_confidence=1.0,
                     mute_audio=mute,
+                    audio_override=True if mute else None,
                     source="manual",
                     status=SceneReviewStatus.approved,
                     reviewed_at=now,

@@ -114,8 +114,8 @@
     r("zinfo").textContent = `${fmt(va)} – ${fmt(vb)} (${Math.round((D / (vb - va)) * 10) / 10}×)  ·  now ${fmt(t, true)}`;
     ruler();
     r("list").innerHTML = clips.length
-      ? "<table class='manual-table'><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th>Mute audio</th><th></th></tr>" +
-        clips.map((c, i) => `<tr><td>${i + 1}</td><td>${fmt(c.s, true)}</td><td>${fmt(c.e, true)}</td><td>${fmt(c.e - c.s)}</td><td><input type="checkbox" data-mute="${i}" ${c.mute ? "checked" : ""} aria-label="Mute audio for clip ${i + 1}"></td>
+      ? "<table class='manual-table'><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th>Force mute (otherwise inherit global)</th><th></th></tr>" +
+        clips.map((c, i) => `<tr><td>${i + 1}</td><td>${fmt(c.s, true)}</td><td>${fmt(c.e, true)}</td><td>${fmt(c.e - c.s)}</td><td><input type="checkbox" data-mute="${i}" ${c.mute ? "checked" : ""} aria-label="Force audio mute for clip ${i + 1}; unchecked inherits global policy"></td>
           <td><button type="button" class="small" data-playclip="${i}">${playingClip === i ? "■ Stop" : "▶ Play"}</button> <button type="button" class="small secondary" data-go="${i}">Go to</button> <button type="button" class="small danger" data-del="${i}">Remove</button></td></tr>`).join("") + "</table>"
       : "";
   }

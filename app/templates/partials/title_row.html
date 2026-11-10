@@ -5,7 +5,7 @@
   {% endif %}
 >
   {% set current_levels = row.title.severity_levels.split(',') %}
-  {% set advisory_confirm = 'DoesTheDogDie reports no nudity/sexual content for this title -- scan anyway?' if row.title.content_advisory_summary == 'No nudity/sexual content reported' else none %}
+  {% set advisory_confirm = ('DoesTheDogDie reports no nudity/sexual content for this title. ' if row.title.content_advisory_summary == 'No nudity/sexual content reported' else '') ~ 'Fresh scan replaces previous scene windows and decisions, including manual windows. Continue?' %}
   <td data-label="Title"><a class="title-link" href="{{ title_href(row.title) }}">{{ row.display_name }}</a></td>
   <td data-label="Status" class="stat-cell-hide-mobile">
     <span class="badge badge-{{ row.status }}">{{ row.status.replace('_', ' ') }}</span>

@@ -21,11 +21,11 @@
               <input type="hidden" name="came_from" value="{{ came_from or '' }}">
               <button type="submit" class="secondary" title="Queue every episode in this show that already has a subtitle (word-list mute)">Process Audio</button>
             </form>
-            <form hx-post="/library/shows/{{ series_id }}/scan-scenes" hx-target="#show-detail-{{ series_id }}" hx-swap="outerHTML">
+            <form hx-post="/library/shows/{{ series_id }}/scan-scenes" hx-confirm="Fresh scan replaces previous scene windows and decisions, including manual windows. Continue?" hx-target="#show-detail-{{ series_id }}" hx-swap="outerHTML">
               <input type="hidden" name="came_from" value="{{ came_from or '' }}">
               <button type="submit" class="secondary" title="Scan every episode in this show for candidate scenes -- no subtitle needed">Process Video</button>
             </form>
-            <form hx-post="/library/shows/{{ series_id }}/process-both" hx-target="#show-detail-{{ series_id }}" hx-swap="outerHTML">
+            <form hx-post="/library/shows/{{ series_id }}/process-both" hx-confirm="Fresh scan replaces previous scene windows and decisions, including manual windows. Continue?" hx-target="#show-detail-{{ series_id }}" hx-swap="outerHTML">
               <input type="hidden" name="came_from" value="{{ came_from or '' }}">
               <button type="submit" title="Process the word list and scan for scenes together, for every episode in this show">Process Both</button>
             </form>

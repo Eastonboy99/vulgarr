@@ -17,7 +17,8 @@
   {% if not hide_scan_trigger or (not detail_view and scan_job and scene_scan_status in ('queued', 'scanning')) %}
   <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
     {% if not hide_scan_trigger %}
-    <form hx-post="/library/title/{{ title_id }}/scan-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
+    <form hx-post="/library/title/{{ title_id }}/scan-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Fresh scan replaces all previous scene windows and review decisions, including manual windows unless Keep manual scenes is selected. The published edit stays unchanged until regeneration. Continue?">
+      <label class="muted"><input type="checkbox" name="keep_manual" value="true"> Keep manual scenes</label>
       {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
       <button type="submit" class="small secondary" {% if scene_scan_status in ('queued', 'scanning') %}disabled{% endif %}>
         {% if scene_scan_status in ('queued', 'scanning') %}
@@ -39,6 +40,19 @@
   </div>
   {% endif %}
 
+  {% if scene_scan_status in ('queued', 'scanning') %}
+    <p class="muted">Showing previous scene results while the replacement scan runs. Apply is unavailable until it finishes.</p>
+  {% endif %}
+  {% if policy_stale %}<p class="muted">Policy changed — review effective actions, then regenerate this title. Existing media has not changed.</p>{% endif %}
+  {% if legacy_evidence or needs_reanalysis %}<p class="muted">Missing clothing-category coverage: a fresh opt-in semantic scan is required. Policy changes cannot infer missing categories.</p>{% endif %}
+  {% if scene_analysis %}<p class="muted">Analysis: {{ scene_analysis.backend }}{% if scene_analysis.model %} · {{ scene_analysis.model }} · {{ scene_analysis.windows }} sampled windows ({{ scene_analysis.window_seconds }} seconds each). Unsampled shots may be missed.{% endif %}</p>{% endif %}
+  {% for category, count in category_counts.items() %}<span class="badge">{{ category_labels[category][0] }}: {{ count }}</span>{% endfor %}
+  {% if scenes %}
+    <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/reset-scene-audio" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Clear all per-scene audio choices, including preserved legacy choices, and use global audio defaults? Media changes only after Apply.">
+      {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
+      <button type="submit" class="small secondary">Use global audio defaults</button>
+    </form>
+  {% endif %}
   {% if scan_job and scene_scan_status in ('queued', 'scanning') %}
     {% if not detail_view %}
     <div class="muted" style="margin-top: 0.4rem; display: flex; align-items: center; gap: 0.5rem;">
@@ -89,11 +103,20 @@
     <div class="muted" style="margin-top: 0.4rem;">{{ claude_verify_job.progress_message }}</div>
   {% endif %}
   {% endif %}
+  <label class="muted">Filter {{ scenes | length }} unique scene windows by category
+    <select id="scene-category-filter-{{ title_id }}" hx-preserve="true"
+      onchange="document.querySelectorAll('#scene-review-{{ title_id }} .scene-review-row').forEach(r=>{r.style.display=(!this.value || r.dataset.sceneCategories.split(' ').includes(this.value))?'flex':'none';})">
+      <option value="">All categories</option>
+      {% for category, count in category_counts.items() %}<option value="{{ category }}">{{ category_labels[category][0] }} ({{ count }})</option>{% endfor %}
+      <option value="__unclassified__">Unclassified / manual / uncertain</option>
+    </select>
+  </label>
   <div class="scene-review-list" style="margin-top: 0.75rem;">
     {% for scene in scenes %}
       {% include "partials/scene_review_row.html" %}
     {% endfor %}
   </div>
+  <script>document.getElementById('scene-category-filter-{{ title_id }}')?.dispatchEvent(new Event('change'));</script>
 
   {% if not detail_view %}
   <div style="margin-top: 0.75rem;">

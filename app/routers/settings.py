@@ -1,17 +1,20 @@
+import json
 from pathlib import Path
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from app.db.session import get_session, get_setting, hash_password, set_setting
 from app.domain import PRECISE_MODES
+from app.scenes.content_policy import CATEGORIES, VISUAL_CATEGORIES, validate_policy
 from app.mux.scene_blur import BLUR_LEVEL_PRESETS, blur_level_to_radius_power, radius_power_to_blur_level
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 templates = Jinja2Templates(directory="app/templates")
 
 SETTING_KEYS = [
+    "scene_content_policy", "scene_semantic_enabled", "scene_semantic_window_seconds",
     "concurrency_cap",
     "off_hours_enabled",
     "off_hours_start",
@@ -75,6 +78,8 @@ async def _load_all() -> dict:
     # app.mux.scene_blur.BLUR_LEVEL_PRESETS for why: friendlier than exposing
     # boxblur's two independent parameters).
     level = radius_power_to_blur_level(int(values["scene_blur_radius"]), int(values["scene_blur_power"]))
+    values["content_categories"] = CATEGORIES
+    values["visual_categories"] = VISUAL_CATEGORIES
     values["scene_blur_level"] = level
     values["scene_blur_level_label"] = BLUR_LEVEL_PRESETS[level][0]
     return values
@@ -159,7 +164,22 @@ async def update_settings(
     claude_vision_api_key: str = Form(""),
     claude_vision_model: str = Form("claude-sonnet-5"),
     claude_vision_skip_above_fraction: float = Form(0.9),
+    scene_content_policy: str = Form(""),
+    scene_semantic_enabled: bool = Form(False),
+    scene_semantic_window_seconds: float = Form(10.0),
 ):
+    # Validate before writing any settings. Old clients omit policy and retain
+    # the current value rather than silently resetting it to defaults.
+    policy = None
+    if scene_content_policy:
+        try:
+            policy = validate_policy(json.loads(scene_content_policy))
+        except (ValueError, TypeError):
+            raise HTTPException(422, "Invalid or unsupported content policy") from None
+    if not 1 <= scene_semantic_window_seconds <= 30:
+        raise HTTPException(422, "Semantic window must be between 1 and 30 seconds")
+    if scene_semantic_enabled and (not claude_vision_base_url.strip() or not claude_vision_model.strip()):
+        raise HTTPException(422, "Semantic analysis requires an explicitly configured vision endpoint/model")
     movie_output_folder = movie_output_folder.strip()
     tv_output_folder = tv_output_folder.strip()
     if any(folder and not Path(folder).is_absolute() for folder in (movie_output_folder, tv_output_folder)):
@@ -253,6 +273,10 @@ async def update_settings(
         await set_setting(session, "scene_blur_pad_start_seconds", max(0.0, scene_blur_pad_start_seconds))
         await set_setting(session, "scene_blur_pad_end_seconds", max(0.0, scene_blur_pad_end_seconds))
         await set_setting(session, "scene_auto_process", scene_auto_process)
+        if policy is not None:
+            await set_setting(session, "scene_content_policy", policy)
+        await set_setting(session, "scene_semantic_enabled", scene_semantic_enabled)
+        await set_setting(session, "scene_semantic_window_seconds", scene_semantic_window_seconds)
         claude_vision_base_url = claude_vision_base_url.strip()
         claude_vision_api_key = claude_vision_api_key.strip()
         # Same defensive pattern as auth_enabled above -- the checkbox can't

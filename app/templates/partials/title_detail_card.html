@@ -5,7 +5,7 @@
 {# Only an explicit "no nudity/sexual content" result gates a scan -- unknown/no-data
    and an explicit "reported" result both proceed immediately, same as before this
    feature existed. See the content-advisory-precheck plan. #}
-{% set advisory_confirm = 'DoesTheDogDie reports no nudity/sexual content for this title -- scan anyway?' if row.title.content_advisory_summary == 'No nudity/sexual content reported' else none %}
+{% set advisory_confirm = ('DoesTheDogDie reports no nudity/sexual content for this title. ' if row.title.content_advisory_summary == 'No nudity/sexual content reported' else '') ~ 'Fresh scan replaces previous scene windows and decisions, including manual windows. Continue?' %}
 <div id="title-detail-{{ row.title.id }}">
   <div class="detail-backdrop">
     {% if row.title.poster_url %}<div class="detail-backdrop-img" style="background-image: url('{{ row.title.poster_url }}');"></div>{% endif %}

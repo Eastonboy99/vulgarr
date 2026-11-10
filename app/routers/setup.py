@@ -9,6 +9,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.db.session import get_session, set_setting
 from app.routers.settings import SETTING_KEYS, _load_all
+from app.scenes.content_policy import validate_policy
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 templates = Jinja2Templates(directory="app/templates")
@@ -53,6 +54,17 @@ async def import_config(request: Request):
             {"ok": False, "error": "No recognized settings found in that file"}, status_code=400
         )
 
+    try:
+        if "scene_content_policy" in filtered:
+            filtered["scene_content_policy"] = validate_policy(filtered["scene_content_policy"])
+        if "scene_semantic_enabled" in filtered and type(filtered["scene_semantic_enabled"]) is not bool:
+            raise ValueError("Semantic opt-in must be Boolean")
+        if "scene_semantic_window_seconds" in filtered:
+            window = filtered["scene_semantic_window_seconds"]
+            if type(window) not in (int, float) or not 1 <= window <= 30:
+                raise ValueError("Semantic window must be between 1 and 30 seconds")
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "Invalid or unsupported content policy settings"}, status_code=400)
     async with get_session() as session:
         for key, value in filtered.items():
             await set_setting(session, key, value)

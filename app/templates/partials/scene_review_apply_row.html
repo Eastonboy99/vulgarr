@@ -4,27 +4,29 @@
    rejected -- Apply needs to be re-run to regenerate the file without them,
    even though nothing *new* is approved. See apply_scene_blur's docstring. #}
 {% set stale_applied = scenes | rejectattr('status.value', 'equalto', 'approved') | selectattr('applied_at') | list %}
-{% set needs_apply = (approved_unapplied or stale_applied) and approved_scenes %}
+{% set needs_apply = approved_unapplied or stale_applied or policy_stale or scene_set_stale %}
 {% set blur_active = blur_job and blur_job.state.value in ('queued', 'processing') %}
 {% set scene_review_target = '#title-detail-' ~ title_id if detail_view else '#scene-review-' ~ title_id %}
 <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
   {% if pending_count %}
-  <form hx-post="/library/title/{{ title_id }}/approve-all-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Approve all {{ pending_count }} pending scene(s)?">
+  <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/approve-all-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Approve all {{ pending_count }} pending scene(s)?">
     {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
     <button type="submit" class="small secondary">Approve all {{ pending_count }} pending scene(s)</button>
   </form>
   {% if high_confidence_pending_count %}
-  <form hx-post="/library/title/{{ title_id }}/approve-high-confidence" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
+  <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/approve-high-confidence" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
     {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
     <button type="submit" class="small secondary">Approve {{ high_confidence_pending_count }} high-confidence scene(s)</button>
   </form>
   {% endif %}
   {% endif %}
-  <form hx-post="/library/title/{{ title_id }}/apply-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
+  <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/apply-scenes" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
     {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
-    <button type="submit" class="small" {% if blur_active or not needs_apply %}disabled{% endif %}>
+    <button type="submit" class="small" {% if blur_active or scene_scan_status in ('queued', 'scanning') or not needs_apply %}disabled{% endif %}>
       {% if blur_active %}
         <span class="spinner"></span> Applying…
+      {% elif policy_stale or scene_set_stale %}
+        Regenerate edit with current decisions
       {% elif stale_applied and not approved_unapplied %}
         Reprocess ({{ approved_scenes | length }} approved, dropping {{ stale_applied | length }} declined)
       {% else %}
