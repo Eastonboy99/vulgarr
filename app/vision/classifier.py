@@ -459,73 +459,99 @@ async def _scan_frames(
             if on_progress is not None:
                 await on_progress(progress_high_water, expected_total)
 
-    async def produce():
+    local_decode_slot = asyncio.Semaphore(1)
+    extraction_parts = {}
+
+    async def prepare_chunk(number, offset):
         nonlocal extracted_fraction, remote_ok, remote_fallback, in_flight
-        offset = 0.0
+        duration = min(chunk_size, remaining_duration - offset)
+        if remote_extract_enabled():
+            in_flight += 1
+            await report(f"Extracting chunk {number + 1}/{chunk_count} (remote)")
+            try:
+                urls = _classifier_urls()
+                url = urls[next(_remote_rr) % len(urls)]
+                response = await _remote_http_client().post(
+                    url + '/scan', timeout=660,
+                    json={'source_url': source_url(video_path),
+                          'start': effective_start_offset + offset,
+                          'duration': duration, 'interval': frame_interval_seconds},
+                )
+                response.raise_for_status()
+                remote_scores = response.json()['scores']
+                count = max(1, round(duration / frame_interval_seconds))
+                if len(remote_scores) != count:
+                    raise ValueError('Incomplete remote scan')
+                for i, score in enumerate(remote_scores):
+                    expected = effective_start_offset + offset + i * frame_interval_seconds
+                    if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
+                        raise ValueError('Invalid remote score')
+                remote_ok += count
+                extraction_parts[number] = duration
+                extracted_fraction = sum(extraction_parts.values()) / remaining_duration
+                return None, remote_scores
+            except Exception:
+                # Do not log exception text: httpx errors contain the
+                # request URL, and source capabilities are credentials.
+                logger.warning('Remote extraction failed; retrying local extraction')
+                remote_fallback += max(1, round(duration / frame_interval_seconds))
+            finally:
+                in_flight -= 1
+
+        tmp = tempfile.TemporaryDirectory()
+        owned_dirs.append(tmp)
+
+        async def extraction_progress(fraction):
+            nonlocal extracted_fraction
+            extraction_parts[number] = fraction * duration
+            extracted_fraction = sum(extraction_parts.values()) / remaining_duration
+            await report(f"Extracting chunk {number + 1}/{chunk_count}")
+
+        async def extract():
+            async with local_decode_slot:
+                await _extract_frames_continuous(
+                    ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
+                    on_extract_progress=extraction_progress,
+                    start_offset=effective_start_offset + offset, clip_duration=duration,
+                )
+        if remote_extract_enabled():
+            # A remote scan's local fallback must rejoin audio/blur exclusion.
+            from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
+            async with HEAVY_PIPELINE_LOCK:
+                await extract()
+        else:
+            await extract()
+        extraction_parts[number] = duration
+        extracted_fraction = sum(extraction_parts.values()) / remaining_duration
+        return tmp, effective_start_offset + offset
+
+    async def produce():
+        # Two requests may overlap on the GPU box, where a decode lock lets
+        # extraction N+1 overlap inference N without parallel source decodes.
+        # Results are delivered in source order; cancellation joins *all*
+        # pending work before any tempdir is removed.
+        pending = []
+        current = None
         try:
             for number in range(chunk_count):
+                if len(pending) == 2:
+                    current = pending.pop(0)
+                    await prepared.put(await current)
+                    current = None
                 await slots.acquire()
-                duration = min(chunk_size, remaining_duration - offset)
-                remote_scores = None
-                if remote_extract_enabled():
-                    in_flight += 1
-                    await report(f"Extracting chunk {number + 1}/{chunk_count} (remote)")
-                    try:
-                        urls = _classifier_urls()
-                        url = urls[next(_remote_rr) % len(urls)]
-                        response = await _remote_http_client().post(
-                            url + '/scan', timeout=660,
-                            json={'source_url': source_url(video_path),
-                                  'start': effective_start_offset + offset,
-                                  'duration': duration, 'interval': frame_interval_seconds},
-                        )
-                        response.raise_for_status()
-                        remote_scores = response.json()['scores']
-                        count = max(1, round(duration / frame_interval_seconds))
-                        if len(remote_scores) != count:
-                            raise ValueError('Incomplete remote scan')
-                        for i, score in enumerate(remote_scores):
-                            expected = effective_start_offset + offset + i * frame_interval_seconds
-                            if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
-                                raise ValueError('Invalid remote score')
-                        remote_ok += count
-                        extracted_fraction = (offset + duration) / remaining_duration
-                        await prepared.put((None, remote_scores))
-                        offset += duration
-                        continue
-                    except Exception:
-                        # Do not log exception text: httpx errors contain the
-                        # request URL, and source capabilities are credentials.
-                        logger.warning('Remote extraction failed; retrying local extraction')
-                        remote_fallback += max(1, round(duration / frame_interval_seconds))
-                    finally:
-                        in_flight -= 1
-                tmp = tempfile.TemporaryDirectory()
-                owned_dirs.append(tmp)
-                async def extraction_progress(fraction):
-                    nonlocal extracted_fraction
-                    extracted_fraction = (offset + fraction * duration) / remaining_duration
-                    await report(f"Extracting chunk {number + 1}/{chunk_count}")
-                async def extract():
-                    await _extract_frames_continuous(
-                        ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
-                        on_extract_progress=extraction_progress,
-                        start_offset=effective_start_offset + offset, clip_duration=duration,
-                    )
-                if remote_extract_enabled():
-                    # Remote scans bypass the outer heavy lock. A fallback
-                    # must rejoin audio/blur exclusion before touching NFS.
-                    from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
-                    async with HEAVY_PIPELINE_LOCK:
-                        await extract()
-                else:
-                    await extract()
-                extracted_fraction = (offset + duration) / remaining_duration
-                await prepared.put((tmp, effective_start_offset + offset))
-                offset += duration
+                pending.append(asyncio.create_task(prepare_chunk(number, number * chunk_size)))
+            while pending:
+                current = pending.pop(0)
+                await prepared.put(await current)
+                current = None
         except Exception as exc:
             await prepared.put(exc)
         finally:
+            if current is not None:
+                pending.append(current)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             await prepared.put(None)
 
     async def classify_batch(items, chunk_abs_start):
