@@ -21,7 +21,11 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+import json
+import re
 from nudenet import NudeDetector
 from starlette.concurrency import run_in_threadpool
 
@@ -76,10 +80,90 @@ async def _detect_upload(frame: UploadFile) -> dict:
         # threadpool so concurrent requests don't serialize on (and time out
         # behind) the event loop. ONNX Runtime sessions are thread-safe for
         # concurrent .run() calls.
-        detections = await run_in_threadpool(detector().detect, tmp_path)
+        detections = await run_in_threadpool(lambda: detector().detect(tmp_path))
     finally:
         Path(tmp_path).unlink(missing_ok=True)
     return {"detections": detections or []}
+
+
+class EncodeParams(BaseModel):
+    source_codec: str
+    crf: int = Field(ge=0, le=51)
+    preset: str
+    # The host supplies its canonical build_blur_filter output. This avoids
+    # a second subtly divergent implementation of enable-window batching.
+    filter_complex: str = Field(max_length=100000)
+
+
+_encode_slot = asyncio.Semaphore(1)
+
+
+def _encode_segment(source: Path, output: Path, params: EncodeParams):
+    # The worker is private-network only, but accepting arbitrary ffmpeg
+    # graphs would still allow movie=/etc/... or network-source filters. Only
+    # accept the host's boxblur grammar, never general ffmpeg expressions.
+    label = r'(?:0:v|vb(?:_stage\d+)?)'
+    number = r'\d+\.\d{3}'
+    term = rf'between\(t,{number},{number}\)'
+    stage = (rf'\[{label}\]boxblur=luma_radius=\d+:luma_power=\d+:'
+             rf"chroma_radius=\d+:chroma_power=\d+:enable='{term}(?:\+{term})*'\[{label}\]")
+    if not re.fullmatch(rf'(?:{stage})(?:;{stage})*|\[0:v\]null\[vb\]', params.filter_complex):
+        raise ValueError('Unsupported blur graph')
+    encoder = {'hevc': 'hevc_nvenc', 'h265': 'hevc_nvenc', 'h264': 'h264_nvenc'}.get(params.source_codec)
+    if encoder is None:
+        raise ValueError('Source codec has no compatible NVENC mapping')
+    # NVENC presets and quality controls are not libx26x's. Use constant
+    # quality VBR, not an invalid -crf or a CPU preset like veryfast.
+    preset = {'ultrafast': 'p1', 'superfast': 'p2', 'veryfast': 'p3',
+              'faster': 'p4', 'fast': 'p4', 'medium': 'p5',
+              'slow': 'p6', 'slower': 'p7', 'veryslow': 'p7'}.get(params.preset, 'p5')
+    cmd = ['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', str(source),
+           '-filter_complex', params.filter_complex, '-map', '[vb]',
+           '-c:v', encoder, '-preset', preset, '-rc', 'vbr', '-cq', str(params.crf),
+           '-b:v', '0', '-an', '-sn', '-f', 'matroska', str(output)]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+    if result.returncode or not output.exists() or not output.stat().st_size:
+        raise RuntimeError('NVENC encode failed')
+
+
+@app.post('/encode')
+async def encode(segment: UploadFile = File(...), params: str = Form(...)):
+    """Private-network segment encoder; CPU-only workers return 503.
+
+    The host retries its original codec-matched software path on *any* failure.
+    A successful encode is not a splice-compatibility guarantee: the host must
+    validate HEVC parameter state and retain final concat decode verification.
+    """
+    try:
+        options = EncodeParams.model_validate(json.loads(params))
+    except Exception:
+        raise HTTPException(422, 'Invalid encode parameters')
+    async with _encode_slot:
+        tmp = tempfile.TemporaryDirectory()
+        directory = Path(tmp.name)
+        try:
+            source = directory / 'segment.mkv'
+            with source.open('wb') as handle:
+                total = 0
+                while chunk := await segment.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > 4 * 1024**3:
+                        raise ValueError('Segment exceeds 4 GiB')
+                    await run_in_threadpool(handle.write, chunk)
+            output = directory / 'encoded.mkv'
+            started = time.monotonic()
+            _stats['in_flight'] += 1
+            try:
+                await run_in_threadpool(_encode_segment, source, output, options)
+                _stats['requests_served'] += 1
+                _stats['total_latency_seconds'] += time.monotonic() - started
+            finally:
+                _stats['in_flight'] -= 1
+            return FileResponse(output, media_type='video/x-matroska',
+                                background=BackgroundTask(tmp.cleanup))
+        except Exception:
+            tmp.cleanup()
+            raise HTTPException(503, 'Remote segment encode unavailable')
 
 
 class ScanRequest(BaseModel):
@@ -89,7 +173,10 @@ class ScanRequest(BaseModel):
     interval: float = Field(gt=0, allow_inf_nan=False)
 
 
-_scan_slot = asyncio.Semaphore(1)
+# Two bounded requests permit decode N+1 to overlap ONNX inference N. Only
+# source decoding is serialized, not the whole extraction+classification job.
+_scan_slot = asyncio.Semaphore(2)
+_decode_lock = threading.Lock()
 _EXPLICIT = {'FEMALE_BREAST_EXPOSED', 'FEMALE_GENITALIA_EXPOSED',
              'MALE_BREAST_EXPOSED', 'MALE_GENITALIA_EXPOSED',
              'BUTTOCKS_EXPOSED', 'ANUS_EXPOSED'}
@@ -112,21 +199,22 @@ def _scan_chunk(params: ScanRequest) -> list[dict]:
         raise ValueError('Too many frames in chunk')
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        for hardware in (True, False):
-            for frame in directory.glob('*.jpg'):
-                frame.unlink()
-            cmd = ['ffmpeg', '-nostdin', '-loglevel', 'error', '-y']
-            if hardware:
-                cmd += ['-hwaccel', 'cuda']
-            cmd += ['-ss', str(params.start), '-rw_timeout', '30000000',
-                    '-i', params.source_url, '-t', str(params.duration),
-                    '-vf', f'fps=1/{params.interval},format=yuvj420p',
-                    '-q:v', '4', str(directory / 'frame_%08d.jpg')]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
-            if result.returncode == 0:
-                break
-        else:
-            raise RuntimeError('Both CUDA and CPU extraction failed')
+        with _decode_lock:
+            for hardware in (True, False):
+                for frame in directory.glob('*.jpg'):
+                    frame.unlink()
+                cmd = ['ffmpeg', '-nostdin', '-loglevel', 'error', '-y']
+                if hardware:
+                    cmd += ['-hwaccel', 'cuda']
+                cmd += ['-ss', str(params.start), '-rw_timeout', '30000000',
+                        '-i', params.source_url, '-t', str(params.duration),
+                        '-vf', f'fps=1/{params.interval},format=yuvj420p',
+                        '-q:v', '4', str(directory / 'frame_%08d.jpg')]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+                if result.returncode == 0:
+                    break
+            else:
+                raise RuntimeError('Both CUDA and CPU extraction failed')
         frames = sorted(directory.glob('*.jpg'))
         # Mirror fps sampling: one score per nominal sample. Missing frames
         # trigger a client retry, never a silently successful short checkpoint.

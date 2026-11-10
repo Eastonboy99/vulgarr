@@ -54,6 +54,11 @@ import asyncio
 import bisect
 import hashlib
 import logging
+import json
+import os
+import tempfile
+
+import httpx
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -1028,6 +1033,99 @@ def _reencode_video_codec(source_codec: str) -> str:
     return codec_map.get(source_codec, "libx264")
 
 
+async def _try_remote_reencode(
+    ffmpeg_bin: str, video_path: Path, segment: VideoSegmentPlan,
+    video_crf: int, video_preset: str, blur_radius: int, blur_power: int,
+    out_path: Path, source_codec: str,
+) -> bool:
+    """Offload only a bounded, keyframe-aligned segment, never the source file.
+
+    Codec names alone are NOT sufficient for HEVC splicing: an NVENC encoder
+    may redefine parameter-set ID 0 with different derived decoder state. We
+    compare the same traced state used by our x265 mitigation, and reject an
+    unknown/mismatched result. NVENC cannot express every x265 knob, so a
+    healthy worker may legitimately fall back to CPU for most HEVC sources.
+    Final whole-output decode verification remains mandatory, as before.
+    """
+    url = os.getenv('SPF_REMOTE_ENCODE_URL', '').rstrip('/')
+    if not url or source_codec not in {'h264', 'hevc', 'h265'}:
+        return False
+    if out_path.exists():
+        return True
+    try:
+        with tempfile.TemporaryDirectory(dir=out_path.parent) as tmp:
+            source = Path(tmp) / 'source.mkv'
+            output = Path(tmp) / 'encoded.mkv'
+            code, _, _ = await _run([
+                ffmpeg_bin, '-y', '-nostdin', '-loglevel', 'error',
+                '-ss', f'{segment.start:.3f}', '-i', str(video_path),
+                '-t', f'{segment.duration:.3f}', '-map', '0:v:0', '-c:v', 'copy',
+                '-an', '-sn', '-avoid_negative_ts', 'make_zero', str(source),
+            ], timeout=_SEGMENT_TIMEOUT_SECONDS)
+            if code:
+                return False
+            params = {
+                'source_codec': source_codec, 'crf': video_crf, 'preset': video_preset,
+                'filter_complex': build_blur_filter(list(segment.local_blur_intervals),
+                    input_label='0:v', output_label='vb', radius=blur_radius, power=blur_power),
+            }
+            async with httpx.AsyncClient(timeout=_SEGMENT_TIMEOUT_SECONDS) as client:
+                with source.open('rb') as handle:
+                    async with client.stream('POST', url + '/encode',
+                            files={'segment': ('segment.mkv', handle, 'video/x-matroska')},
+                            data={'params': json.dumps(params)}) as response:
+                        response.raise_for_status()
+                        with output.open('wb') as encoded:
+                            async for chunk in response.aiter_bytes():
+                                encoded.write(chunk)
+            if not output.stat().st_size:
+                return False
+            from app.config import settings as app_settings
+
+            async def stream_identity(path):
+                code, data, _ = await _run([
+                    app_settings.ffprobe_bin, '-v', 'error', '-select_streams', 'v:0',
+                    '-show_entries',
+                    'stream=codec_name,profile,width,height,pix_fmt,level,field_order,color_range,color_space,color_transfer,color_primaries,sample_aspect_ratio,r_frame_rate,start_time:format=duration',
+                    '-of', 'json', str(path),
+                ], timeout=60)
+                if code:
+                    raise ValueError('Cannot probe remote segment')
+                probe_data = json.loads(data)
+                stream = probe_data['streams'][0]
+                if not all(stream.get(k) for k in ('codec_name', 'width', 'height', 'pix_fmt')):
+                    raise ValueError('Incomplete stream identity')
+                # A stream-copy upload is safe only when its timestamp origin
+                # and duration still match the local blur-window coordinate
+                # system. Reject fuzzy cuts instead of moving the blur itself.
+                if abs(float(stream.pop('start_time', 0))) > 0.05:
+                    raise ValueError('Segment timestamp origin drifted')
+                if abs(float(probe_data['format']['duration']) - segment.duration) > 0.25:
+                    raise ValueError('Segment duration drifted')
+                return stream
+
+            if await stream_identity(source) != await stream_identity(output):
+                logger.warning('Rejecting NVENC segment: stream identity differs')
+                return False
+            if source_codec in {'hevc', 'h265'}:
+                original = await _probe_source_hevc_params(ffmpeg_bin, video_path, segment.start)
+                produced = await _probe_source_hevc_params(ffmpeg_bin, output, 0)
+                if original is None or produced is None or original != produced:
+                    logger.warning('Rejecting NVENC segment: HEVC parameter state differs or is unknown')
+                    return False
+            # An HTTP 200 is not evidence that the body is a decodable MKV.
+            code, _, _ = await _run([ffmpeg_bin, '-nostdin', '-v', 'error', '-xerror',
+                                     '-i', str(output), '-map', '0:v:0', '-f', 'null', '-'],
+                                    timeout=_SEGMENT_TIMEOUT_SECONDS)
+            if code:
+                return False
+            output.replace(out_path)
+            return True
+    except Exception:
+        logger.warning('Remote encode failed; using codec-matched CPU encoder', exc_info=True)
+        return False
+
+
 async def _extract_reencode_segment(
     ffmpeg_bin: str,
     video_path: Path,
@@ -1038,7 +1136,7 @@ async def _extract_reencode_segment(
     blur_power: int,
     out_ts_path: Path,
     source_codec: str = "",
-) -> None:
+) -> str:
     """Re-encodes one scene (plus its keyframe-alignment buffer), boxblur active
     only during the segment's own local scene windows. Unlike the copy case
     above, independent per-segment `-ss`/`-t` here is accurate: any ffmpeg
@@ -1063,6 +1161,9 @@ async def _extract_reencode_segment(
     docstring for the real splice-corruption bug this avoids. A probe failure
     (non-HEVC source, unexpected ffmpeg output) falls back to today's
     unmatched re-encode with no other change in behavior."""
+    if await _try_remote_reencode(ffmpeg_bin, video_path, segment, video_crf,
+                                  video_preset, blur_radius, blur_power, out_ts_path, source_codec):
+        return "NVENC"
     codec = _reencode_video_codec(source_codec)
     x265_params = None
     if source_codec == "hevc":
@@ -1091,6 +1192,7 @@ async def _extract_reencode_segment(
         build_cmd, out_ts_path, _SEGMENT_TIMEOUT_SECONDS,
         f"ffmpeg segment re-encode failed for {video_path} [{segment.start:.2f}-{segment.end:.2f}]",
     )
+    return "CPU"
 
 
 async def _build_video_whole_file_reencode(
