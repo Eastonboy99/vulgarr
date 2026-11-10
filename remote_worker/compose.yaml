@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     ports: ["7861:7861"]
     environment:
+      # device_ids reservation is ignored on Docker Desktop/WSL2 -- pin the GPU
+      # explicitly or every container sees all devices and defaults to GPU 0.
+      NVIDIA_VISIBLE_DEVICES: "${SPF_GPU_0:-0}"
       SPF_SOURCE_BASE_URL: ${SPF_SOURCE_BASE_URL:-}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes: ["models-0:/models"]
@@ -19,6 +22,7 @@ services:
     restart: unless-stopped
     ports: ["7862:7861"]
     environment:
+      NVIDIA_VISIBLE_DEVICES: "${SPF_GPU_1:-1}"
       SPF_SOURCE_BASE_URL: ${SPF_SOURCE_BASE_URL:-}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes: ["models-1:/models"]
