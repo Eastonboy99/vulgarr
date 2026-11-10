@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -333,7 +334,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # ~1.3x on top of that for double the in-flight work -- 8 is the point
     # where this stops paying for itself. Lower this if the box is under
     # memory/CPU pressure from other services sharing it.
-    "scene_frame_classify_concurrency": 8,
+    # Seed an adaptive default; existing explicit/saved settings are preserved.
+    "scene_frame_classify_concurrency": 16 if os.getenv("SPF_CLASSIFIER_URLS", "").strip() else 8,
     # After the main scan finds candidates, each one gets a second, much denser
     # re-scan of just its own padded window (see
     # app.vision.classifier.scan_window_frames) -- cheap, since it's a single
