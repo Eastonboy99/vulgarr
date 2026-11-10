@@ -100,7 +100,11 @@ def _audio_row(job: ProcessingJob) -> dict:
 
 
 def _scene_row(job: SceneJob) -> dict:
+    # Persisted progress text survives every htmx refresh and server restart.
+    import re
+    fallback = re.search(r'· fallback (\d+)', job.progress_message or '')
     return {
+        'remote_fallback': int(fallback.group(1)) if fallback else 0,
         "title": job.title,
         "kind_label": "Scene",
         "detail": job.kind.value,

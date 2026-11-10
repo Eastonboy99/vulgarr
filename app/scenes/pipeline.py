@@ -39,6 +39,8 @@ ScanProgressCallback = Callable[[int, int], Awaitable[None]]
 @dataclass(frozen=True)
 class ScanOutcome:
     candidate_count: int
+    auto_approved_count: int = 0
+    need_review_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -335,6 +337,7 @@ async def scan_for_scenes(
     # or the request itself failing/timing out (confirmed is None either way)
     # -- fall back to pending, since those are real unknowns, not verdicts.
     now = datetime.datetime.utcnow()
+    auto_approved_count = need_review_count = 0
     for candidate, (start, end, frac), confirmed, reason, mute_audio in zip(
         candidates, refined, claude_confirmed, claude_reasons, claude_mute_audio
     ):
@@ -346,6 +349,8 @@ async def scan_for_scenes(
             status = SceneReviewStatus.rejected
         else:
             status = SceneReviewStatus.pending
+        auto_approved_count += int(status == SceneReviewStatus.approved)
+        need_review_count += int(status == SceneReviewStatus.pending)
         session.add(
             DetectedScene(
                 title_id=title.id,
@@ -366,7 +371,8 @@ async def scan_for_scenes(
     # fresh scan_work_dir regardless, so there's nothing to gain by keeping it.
     shutil.rmtree(scan_work_dir, ignore_errors=True)
 
-    return ScanOutcome(candidate_count=len(candidates))
+    return ScanOutcome(candidate_count=len(candidates), auto_approved_count=auto_approved_count,
+                       need_review_count=need_review_count)
 
 
 async def apply_scene_blur(

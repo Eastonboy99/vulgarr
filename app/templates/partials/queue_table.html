@@ -28,6 +28,7 @@
               <div class="job-progress" style="display: inline-block; vertical-align: middle;"><div class="job-progress-fill" style="width: {{ row.progress_percent }}%"></div></div>
             {% endif %}
             {{ row.progress_message or '—' }}
+            {% if row.remote_fallback %}<span class="badge badge-failed">Remote fallback: {{ row.remote_fallback }} frames</span>{% endif %}
           {% endif %}
         </td>
         <td data-label="">
@@ -60,7 +61,7 @@
         <td data-label="Type" class="muted">{{ row.kind_label }} &middot; {{ row.detail }}</td>
         <td data-label="State"><span class="badge badge-{{ row.state.value }}">{{ row.state.value }}</span></td>
         <td data-label="Duration" class="muted">{{ format_duration((row.finished_at - row.started_at).total_seconds()) if row.started_at and row.finished_at else '—' }}</td>
-        <td data-label="Result" class="muted result-cell" title="{{ row.error or row.progress_message or '' }}">{{ row.error or row.progress_message or '—' }}</td>
+        <td data-label="Result" class="muted result-cell" title="{{ row.error or row.progress_message or '' }}">{{ row.error or row.progress_message or '—' }}{% if row.kind_label == 'Scene' and row.detail == 'scan' %} · <a href="/library/title/{{ row.title.id }}/scene-review">Review scenes</a>{% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="5" class="muted">No jobs run yet.</td></tr>

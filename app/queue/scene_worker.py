@@ -318,6 +318,7 @@ class SceneJobQueue:
             job_start_monotonic = time.monotonic()
             last_update_monotonic = 0.0
             scan_phase = "Scanning for scenes"
+            scan_counters = ""
 
             async def on_scan_progress(done: int, total: int) -> None:
                 nonlocal last_update_monotonic
@@ -371,7 +372,12 @@ class SceneJobQueue:
                 await session.commit()
 
             async def on_scan_stage(message: str) -> None:
-                nonlocal scan_phase
+                nonlocal scan_phase, scan_counters
+                if ' · remote ' in message:
+                    # Retain the latest counters through dense rescans/VLM
+                    # stages and in the terminal summary after polling swaps.
+                    telemetry = message.split(' · remote ', 1)[1]
+                    scan_counters = ' · remote ' + ' · '.join(telemetry.split(' · ')[:2])
                 scan_phase = message
                 if message.startswith(("Extracting chunk", "Classifying ")):
                     return  # The paired progress callback throttles database writes.
@@ -380,7 +386,7 @@ class SceneJobQueue:
                 # scan finishes, so the per-candidate verification pass that
                 # follows is a (typically short) tail step, not something that
                 # needs its own slice of the bar.
-                job.progress_message = message
+                job.progress_message = message + scan_counters
                 await session.commit()
 
             async def on_claude_verify_progress(done: int, total: int) -> None:
@@ -404,7 +410,11 @@ class SceneJobQueue:
                         scan_outcome = await scan_for_scenes(
                             session, title, job.id, on_progress=on_scan_progress, on_stage=on_scan_stage
                         )
-                    job.progress_message = f"Done -- found {scan_outcome.candidate_count} candidate scene(s)"
+                    job.progress_message = (
+                        f"{scan_outcome.candidate_count} candidates · "
+                        f"{scan_outcome.auto_approved_count} auto-approved · "
+                        f"{scan_outcome.need_review_count} need review"
+                    ) + scan_counters
                     title.scene_scan_status = "scanned" if scan_outcome.candidate_count else "no_scenes_found"
 
                     # Chain straight into a blur/Apply job when auto-process is on
