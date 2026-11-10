@@ -63,7 +63,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Awaitable
 
 from app.audio.mute import MuteInterval, _MAX_TERMS_PER_STAGE
 from app.common.intervals import merge_intervals
@@ -969,6 +969,33 @@ async def _split_copy_audio_segments(
         raise RemuxError(f"ffmpeg audio segment-copy split failed for {video_path}: {err.strip()[-2000:]}")
 
 
+async def _filter_audio_continuously(
+    ffmpeg_bin: str, audio_source: Path, intervals: list[MuteInterval],
+    num_audio_streams: int, audio_bitrate: str, out_path: Path, timeout: float,
+) -> None:
+    """Decode/filter/encode each real audio track in one uninterrupted session.
+
+    Splicing copied AAC/HE-AAC with locally encoded AAC is unsafe even when
+    codec names match: profile, extradata and encoder delay can differ. Use
+    continuous AAC-LC instead, retaining input sample rates/channel counts
+    (never force stereo). Only the first real audio streams are mapped; the
+    clean master's trailing timing anchor is deliberately excluded. This costs
+    a full audio encode but guarantees one codec configuration per track.
+    """
+    from app.audio.mute import build_volume_filter
+
+    expression = ";".join(build_volume_filter(intervals, f"0:a:{i}", f"muted{i}")
+                          for i in range(num_audio_streams))
+    def build_cmd(tmp_out: Path) -> list[str]:
+        cmd = [ffmpeg_bin, "-y", "-nostdin", "-loglevel", "error", "-i", str(audio_source),
+               "-filter_complex", expression]
+        for i in range(num_audio_streams):
+            cmd += ["-map", f"[muted{i}]", f"-c:a:{i}", "aac", f"-profile:a:{i}", "aac_low",
+                    f"-b:a:{i}", audio_bitrate]
+        return cmd + ["-vn", "-sn", "-dn", "-f", "matroska", str(tmp_out)]
+    await _run_atomic(build_cmd, out_path, timeout, "Continuous scene audio filtering failed")
+
+
 async def _extract_mute_audio_segment(
     ffmpeg_bin: str,
     video_path: Path,
@@ -1534,7 +1561,13 @@ async def build_blurred_video(
     video_codec = (video_stream or {}).get("codec_name", "")
 
     try:
-        if force_whole_file_video:
+        if not blur_intervals:
+            # Explicit regeneration with every category allowed/rejected must
+            # restore pristine video, not re-encode it or look for copy segments
+            # that the empty-window plan never split. Finalization still repairs
+            # AV interleaving and preserves sparse source streams.
+            concatenated_video_path = video_path
+        elif force_whole_file_video:
             # apply_blur's fallback path -- see _build_video_whole_file_reencode's
             # docstring for why this exists at all. Separate filename from the
             # segment pipeline's concatenated.mkv (not reused) so a stale copy
@@ -1797,50 +1830,20 @@ async def build_blurred_video(
                     await on_stage("Combining segments")
                 await _concat_video_segments(ffmpeg_bin, segment_ts_paths, concatenated_video_path)
 
-        # Same split/copy/reencode/concat approach as video, applied to
-        # audio -- only the muted windows get decoded+re-encoded, the rest
-        # is stream-copied. Skipped entirely when there's nothing to mute
-        # (the common case): _mux_final_output's plain -c:a copy path
-        # below is already as cheap as this could ever get. See
-        # plan_audio_segments for why this exists at all -- a real,
-        # measured bottleneck on a long multi-track file, not a
-        # hypothetical one.
+        # Use one encoder configuration for every real audio track. Copied
+        # AAC/HE-AAC segments cannot safely be spliced with local AAC encodes.
+        # With no mute windows, preserve the inexpensive stream-copy path.
         concatenated_audio_path: Path | None = None
         if mute_intervals:
-            concatenated_audio_path = tmp_root / "concatenated_audio.mkv"
+            concatenated_audio_path = tmp_root / "continuous_audio_v1.mkv"
             if concatenated_audio_path.exists():
                 logger.info("Resuming blur for %s: audio already combined, skipping", video_path)
             else:
                 if on_stage is not None:
-                    await on_stage("Splitting audio")
-                audio_segments = plan_audio_segments(mute_intervals, total_duration)
-                audio_segment_paths: list[Path] = []
-                if len(audio_segments) > 1:
-                    audio_boundaries = [s.end for s in audio_segments[:-1]]
-                    await _split_copy_audio_segments(
-                        ffmpeg_bin, audio_source, audio_boundaries, len(audio_streams), tmp_root
-                    )
-                for i, aseg in enumerate(audio_segments):
-                    if aseg.mute:
-                        aseg_ts_path = tmp_root / f"amute_{i:04d}.mkv"
-                        if not aseg_ts_path.exists():
-                            await _extract_mute_audio_segment(
-                                ffmpeg_bin, audio_source, aseg, len(audio_streams), audio_bitrate, aseg_ts_path
-                            )
-                    else:
-                        # Same duration/start_time metadata problem and fix
-                        # as the video-side copy segments -- see
-                        # _normalize_segment_timestamps.
-                        raw_aseg_ts_path = tmp_root / f"acopy_{i:04d}.mkv"
-                        aseg_ts_path = tmp_root / f"acopy_{i:04d}_fixed.mkv"
-                        if not aseg_ts_path.exists():
-                            await _normalize_segment_timestamps(ffmpeg_bin, raw_aseg_ts_path, aseg_ts_path)
-                    audio_segment_paths.append(aseg_ts_path)
-
-                if on_stage is not None:
-                    await on_stage("Combining audio")
-                await _concat_audio_segments(
-                    ffmpeg_bin, audio_segment_paths, len(audio_streams), concatenated_audio_path
+                    await on_stage("Muting every playback audio track (continuous encode)")
+                await _filter_audio_continuously(
+                    ffmpeg_bin, audio_source, mute_intervals, len(audio_streams),
+                    audio_bitrate, concatenated_audio_path, timeout,
                 )
 
         if on_stage is not None:
@@ -1969,6 +1972,7 @@ async def apply_blur(
     on_stage: StageCallback | None = None,
     output_path: Path | None = None,
     audio_source_path: Path | None = None,
+    before_publish: Callable[[], Awaitable[None]] | None = None,
 ) -> Path:
     """work_dir: a persistent directory (see app.scenes.pipeline.apply_scene_blur
     for how it's derived from the SceneJob id) that build_blurred_video reuses
@@ -1989,8 +1993,6 @@ async def apply_blur(
     represents the more useful, more recent information."""
     if not video_path.exists():
         raise RemuxError(f"Video file does not exist: {video_path}")
-    if not blur_intervals:
-        raise RemuxError("No approved scene windows to apply")
     await asyncio.to_thread(remove_orphaned_temp_files, video_path)
 
     if output_path is not None and output_path.resolve() == video_path.resolve():
@@ -2052,6 +2054,8 @@ async def apply_blur(
     try:
         if on_stage is not None:
             await on_stage("Publishing Vulgarr Edit")
+        if before_publish is not None:
+            await before_publish()
         from app.output import publish_file
         await publish_file(tmp_path, final_path)
     except BaseException:

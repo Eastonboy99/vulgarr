@@ -134,6 +134,12 @@ class Title(Base):
     # organically-growing small set of display states, not a fixed vocabulary
     # anything else needs to switch on.
     scene_scan_status: Mapped[str] = mapped_column(String(20), default="not_scanned", nullable=False)
+    # The requested job is the durable generation/activation fence. Restarting
+    # that job resumes its checkpoint; a new job always means a fresh reset.
+    scene_scan_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scene_policy_applied: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scene_set_applied: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scene_analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Set by a blur Apply or separate-library audio run. Reprocessing publishes
     # a replacement at the configured destination (legacy blur uses a sibling).
@@ -211,17 +217,20 @@ class DetectedScene(Base):
     # only thing that acts on the underlying verdict.
     claude_verify_reason: Mapped[str | None] = mapped_column(nullable=True)
 
-    # Whether Apply should also mute audio for this window, on top of always
-    # blurring the video -- default off. Nudity isn't always something the
-    # audio needs muting for too (plot-relevant scenes, dialogue continuing
-    # over it), so this is a separate, explicit per-scene opt-in rather than
-    # bundled into approval the way it originally was.
+    # Compatibility flag retained for legacy verifier/manual clients. Rendering
+    # resolves category action + global audio default + nullable override;
+    # approval alone is not the policy/action model.
     mute_audio: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # None inherits global policy. Migration preserves legacy booleans as
+    # explicit choices; users can deliberately reset them to inheritance.
+    audio_override: Mapped[bool | None] = mapped_column(nullable=True)
+    action_override: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    category_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detector_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # "detected" for a classifier candidate, "manual" for a window the user
-    # marked by hand on the scene review page's scrub timeline. Manual scenes
-    # are created already-approved, so a rescan (which only clears pending/
-    # rejected candidates) leaves them alone.
+    # Fresh scans replace every prior window, including manual decisions.
+    # A job may explicitly opt into preserving manual windows.
+    scan_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source: Mapped[str] = mapped_column(String(20), default="detected", nullable=False)
 
     status: Mapped[SceneReviewStatus] = mapped_column(
@@ -304,6 +313,7 @@ class SceneJob(Base):
     kind: Mapped[SceneJobKind] = mapped_column(Enum(SceneJobKind), nullable=False)
     state: Mapped[JobState] = mapped_column(Enum(JobState), default=JobState.queued, nullable=False)
 
+    keep_manual: Mapped[bool] = mapped_column(default=False, nullable=False)
     progress_message: Mapped[str | None] = mapped_column(String(256), nullable=True)
     progress_percent: Mapped[float | None] = mapped_column(nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

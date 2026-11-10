@@ -75,6 +75,9 @@ class SceneJobQueue:
                         interrupted_videos.append(Path(title.video_path))
                 if job.kind == SceneJobKind.scan:
                     active_scan_title_ids.add(job.title_id)
+                    # Upgrade interrupted pre-generation jobs in place.
+                    if title is not None and title.scene_scan_generation is None:
+                        title.scene_scan_generation = job.id
 
             # Defensive reconciliation: a Title stuck showing "queued"/"scanning"
             # with no actual SceneJob behind it (the requeue loop above only
@@ -140,17 +143,34 @@ class SceneJobQueue:
             await session.commit()
         return True, None
 
-    async def enqueue_scan(self, title_id: int) -> int:
+    async def enqueue_scan(self, title_id: int, *, keep_manual: bool = False) -> int:
+        """Claim a fresh generation using a database write, not a check-then-insert.
+
+        SQLite serializes the conditional UPDATE across processes. The title
+        claim and job creation commit together, including for bulk callers.
+        Zero means the title is missing or already has an active scene job.
+        """
         async with get_session() as session:
-            job = SceneJob(title_id=title_id, kind=SceneJobKind.scan, state=JobState.queued)
+            active = select(SceneJob.id).where(
+                SceneJob.title_id == title_id,
+                SceneJob.state.in_([JobState.queued, JobState.processing]),
+            ).exists()
+            claimed = await session.execute(
+                update(Title).where(Title.id == title_id, ~active)
+                .values(scene_scan_status="queued")
+            )
+            if not claimed.rowcount:
+                return 0
+            job = SceneJob(title_id=title_id, kind=SceneJobKind.scan,
+                           state=JobState.queued, keep_manual=keep_manual)
             session.add(job)
-            title = await session.get(Title, title_id)
-            if title is not None:
-                title.scene_scan_status = "queued"
+            await session.flush()
+            await session.execute(update(Title).where(Title.id == title_id)
+                                  .values(scene_scan_generation=job.id))
+            job_id = job.id
             await session.commit()
-            await session.refresh(job)
-        await self._pending.put(job.id)
-        return job.id
+        await self._pending.put(job_id)
+        return job_id
 
     async def enqueue_scan_if_not_already_active(self, title_id: int) -> bool:
         """Mirrors app.library.enqueue_if_not_already_active -- used by both the
@@ -158,62 +178,31 @@ class SceneJobQueue:
         double-click or an overlapping bulk trigger doesn't queue a second scan for
         a title that's already queued/processing. Returns whether it actually
         enqueued (vs. skipped as a duplicate)."""
-        async with get_session() as session:
-            existing = await session.execute(
-                select(SceneJob).where(
-                    SceneJob.title_id == title_id,
-                    SceneJob.kind == SceneJobKind.scan,
-                    SceneJob.state.in_([JobState.queued, JobState.processing]),
-                )
-            )
-            if existing.scalar_one_or_none() is not None:
-                return False
-        await self.enqueue_scan(title_id)
-        return True
+        return bool(await self.enqueue_scan(title_id))
 
     async def enqueue_scan_for_titles_if_not_already_active(self, title_ids: list[int]) -> int:
-        """Batched form of enqueue_scan_if_not_already_active for the bulk
-        "process both" season/show actions -- one session/transaction for the
-        whole list instead of 1-2 DB round trips per title, so a large show
-        doesn't turn one click into dozens of sequential queries before the
-        request can return. Returns how many were actually enqueued (vs.
-        skipped as already active)."""
-        if not title_ids:
-            return 0
-        async with get_session() as session:
-            existing = await session.execute(
-                select(SceneJob.title_id).where(
-                    SceneJob.title_id.in_(title_ids),
-                    SceneJob.kind == SceneJobKind.scan,
-                    SceneJob.state.in_([JobState.queued, JobState.processing]),
-                )
-            )
-            already_active = {row[0] for row in existing.all()}
-            to_enqueue = [tid for tid in title_ids if tid not in already_active]
-            if not to_enqueue:
-                return 0
-            jobs = [SceneJob(title_id=tid, kind=SceneJobKind.scan, state=JobState.queued) for tid in to_enqueue]
-            session.add_all(jobs)
-            await session.execute(update(Title).where(Title.id.in_(to_enqueue)).values(scene_scan_status="queued"))
-            # Flush (not commit) to assign each job's id while the objects are still
-            # attached and readable -- commit would expire them, and this async
-            # session can't do the implicit lazy-reload that a sync session would
-            # use to re-fetch an expired attribute on next access.
-            await session.flush()
-            job_ids = [job.id for job in jobs]
-            await session.commit()
-        for job_id in job_ids:
-            await self._pending.put(job_id)
-        return len(job_ids)
+        """Claim each distinct title atomically through the shared enqueue path."""
+        return sum([bool(await self.enqueue_scan(tid)) for tid in dict.fromkeys(title_ids)])
 
     async def enqueue_blur(self, title_id: int) -> int:
+        """Atomically exclude scans and other scene work while applying a set."""
+        return await self._enqueue_existing_set_job(title_id, SceneJobKind.blur)
+
+    async def _enqueue_existing_set_job(self, title_id: int, kind: SceneJobKind) -> int:
         async with get_session() as session:
-            job = SceneJob(title_id=title_id, kind=SceneJobKind.blur, state=JobState.queued)
+            active = select(SceneJob.id).where(SceneJob.title_id == title_id,
+                SceneJob.state.in_([JobState.queued, JobState.processing])).exists()
+            claimed = await session.execute(update(Title).where(Title.id == title_id, ~active)
+                .values(scene_scan_status=Title.scene_scan_status))
+            if not claimed.rowcount:
+                return 0
+            job = SceneJob(title_id=title_id, kind=kind, state=JobState.queued)
             session.add(job)
+            await session.flush()
+            job_id = job.id
             await session.commit()
-            await session.refresh(job)
-        await self._pending.put(job.id)
-        return job.id
+        await self._pending.put(job_id)
+        return job_id
 
     async def enqueue_blur_if_not_already_active(self, title_id: int) -> bool:
         """Same dedup reasoning as enqueue_scan_if_not_already_active -- a
@@ -229,17 +218,10 @@ class SceneJobQueue:
             )
             if existing.scalar_one_or_none() is not None:
                 return False
-        await self.enqueue_blur(title_id)
-        return True
+        return bool(await self.enqueue_blur(title_id))
 
     async def enqueue_claude_verify(self, title_id: int) -> int:
-        async with get_session() as session:
-            job = SceneJob(title_id=title_id, kind=SceneJobKind.claude_verify, state=JobState.queued)
-            session.add(job)
-            await session.commit()
-            await session.refresh(job)
-        await self._pending.put(job.id)
-        return job.id
+        return await self._enqueue_existing_set_job(title_id, SceneJobKind.claude_verify)
 
     async def enqueue_claude_verify_if_not_already_active(self, title_id: int) -> bool:
         """Same dedup reasoning as enqueue_scan_if_not_already_active -- a double-click
@@ -255,8 +237,7 @@ class SceneJobQueue:
             )
             if existing.scalar_one_or_none() is not None:
                 return False
-        await self.enqueue_claude_verify(title_id)
-        return True
+        return bool(await self.enqueue_claude_verify(title_id))
 
     async def _dispatch_loop(self) -> None:
         while not self._stopping:
@@ -288,12 +269,16 @@ class SceneJobQueue:
 
     async def _run_job(self, job_id: int) -> None:
         async with get_session() as session:
+            # Duplicate queue deliveries must not start two inference/render
+            # pipelines. Restart reconciliation intentionally restores queued.
+            claimed = await session.execute(update(SceneJob).where(
+                SceneJob.id == job_id, SceneJob.state == JobState.queued,
+            ).values(state=JobState.processing, started_at=datetime.datetime.utcnow()))
+            if not claimed.rowcount:
+                return
             job = await session.get(SceneJob, job_id)
-            if job is None:
-                return
-            if job.state == JobState.cancelled:
-                return
-            title = await session.get(Title, job.title_id)
+            title_id = job.title_id
+            title = await session.get(Title, title_id)
             if title is None:
                 job.state = JobState.failed
                 job.error = "Title no longer exists"
@@ -429,7 +414,7 @@ class SceneJobQueue:
                     # approved. A concurrent manual scan-scenes/apply-scenes click
                     # can't double-enqueue here -- enqueue_blur_if_not_already_active
                     # checks for an existing queued/processing blur job first.
-                    if scan_outcome.candidate_count and bool(await get_setting(session, "scene_auto_process")):
+                    if (scan_outcome.candidate_count or title.vulgarr_edit_path) and bool(await get_setting(session, "scene_auto_process")):
                         await session.commit()
                         await self.enqueue_blur_if_not_already_active(title.id)
                 elif is_claude_verify:
@@ -462,20 +447,28 @@ class SceneJobQueue:
                 job.finished_at = datetime.datetime.utcnow()
 
             except asyncio.CancelledError:
+                await session.rollback()
+                job = await session.get(SceneJob, job_id, populate_existing=True)
+                title = await session.get(Title, title_id, populate_existing=True)
+                if job.state == JobState.done:
+                    raise
                 job.state = JobState.cancelled
                 job.error = "Cancelled by user"
                 job.finished_at = datetime.datetime.utcnow()
-                if is_scan:
+                if is_scan and title is not None and title.scene_scan_generation == job_id:
                     title.scene_scan_status = "not_scanned"
                 await session.commit()
                 raise  # required so the Task itself is properly marked cancelled
 
             except Exception as exc:  # noqa: BLE001 -- surface all failures to the UI
-                logger.exception("Scene %s failed for title %s", job.kind.value, title.id)
+                await session.rollback()
+                job = await session.get(SceneJob, job_id, populate_existing=True)
+                title = await session.get(Title, title_id, populate_existing=True)
+                logger.exception("Scene %s failed for title %s", job.kind.value, title_id)
                 job.state = JobState.failed
                 job.error = str(exc)
                 job.finished_at = datetime.datetime.utcnow()
-                if is_scan:
+                if is_scan and title is not None and title.scene_scan_generation == job_id:
                     title.scene_scan_status = "scan_failed"
                 if job.kind == SceneJobKind.blur:
                     # A failed blur job is terminal -- apply_scene_blur's docstring

@@ -29,6 +29,9 @@ DEFAULT_MIN_CONSECUTIVE_FRAMES = 2
 class FrameScore:
     timestamp: float
     confidence: float
+    # None denotes a legacy scalar-only worker/checkpoint, never category
+    # coverage. Raw NudeNet labels are not semantic clothing labels.
+    detections: list[dict] | None = None
 
 
 @dataclass(frozen=True)

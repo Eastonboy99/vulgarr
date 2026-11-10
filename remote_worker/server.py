@@ -232,10 +232,13 @@ def _scan_chunk(params: ScanRequest) -> list[dict]:
         if len(frames) != expected:
             raise RuntimeError('Incomplete decoded chunk')
         det = detector()
-        return [{'t': params.start + i * params.interval,
-                 'c': max((d['score'] for d in det.detect(str(frame))
-                           if d.get('class') in _EXPLICIT), default=0.0)}
-                for i, frame in enumerate(frames)]
+        scores = []
+        for i, frame in enumerate(frames):
+            detections = det.detect(str(frame)) or []
+            scores.append({'schema_version': 2, 't': params.start + i * params.interval,
+                'c': max((d['score'] for d in detections if d.get('class') in _EXPLICIT), default=0.0),
+                'detections': detections})
+        return scores
 
 
 @app.post('/scan')
@@ -248,7 +251,9 @@ async def scan(params: ScanRequest):
             _stats['requests_served'] += 1
             _stats['frames_served'] += len(scores)
             _stats['total_latency_seconds'] += time.monotonic() - started
-            return {'scores': scores}
+            return {'scores': scores, 'schema_version': 2,
+                    'capabilities': ['nudenet.raw_detections'],
+                    'semantic_categories': []}
         except Exception:
             # Do not echo signed source URLs (including in subprocess errors).
             raise HTTPException(503, 'Remote extraction failed')

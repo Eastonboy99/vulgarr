@@ -391,7 +391,7 @@ def test_scene_apply_preserves_clean_audio_and_rejects_stale_master(monkeypatch,
         cache.unlink()
     if cache_state == 'changed_source':
         source.write_bytes(b'new source edition')
-    scene = SimpleNamespace(start_seconds=2, end_seconds=3, mute_audio=True,
+    scene = SimpleNamespace(id=1, start_seconds=2, end_seconds=3, mute_audio=True,
                             status=SceneReviewStatus.approved, applied_at=None)
     class Session(FakeSession):
         async def execute(self, query):
@@ -484,10 +484,11 @@ def test_scene_mute_pipeline_reads_cached_audio_not_original_tracks(monkeypatch,
     async def split(binary, path, boundaries, count, directory):
         assert path == cache and count == 2
         calls.append('split')
-    async def mute(binary, path, segment, count, bitrate, output_path):
+    async def continuous(binary, path, intervals, count, bitrate, output_path, timeout):
         assert path == cache and count == 2
-        output_path.write_bytes(b'muted')
-        calls.append('mute')
+        assert intervals == [MuteInterval(2, 3)]
+        output_path.write_bytes(b'processed audio')
+        calls.append('continuous')
     async def normalize(binary, path, output_path):
         output_path.write_bytes(b'copy')
     async def concat(binary, paths, count, output_path):
@@ -499,7 +500,7 @@ def test_scene_mute_pipeline_reads_cached_audio_not_original_tracks(monkeypatch,
         assert options['concatenated_audio_path'].read_bytes() == b'processed audio'
         options['out_path'].write_bytes(b'finished edit')
     for name, replacement in [('probe', probe), ('_build_video_whole_file_reencode', video),
-            ('_split_copy_audio_segments', split), ('_extract_mute_audio_segment', mute),
+            ('_split_copy_audio_segments', split), ('_filter_audio_continuously', continuous),
             ('_normalize_segment_timestamps', normalize), ('_concat_audio_segments', concat),
             ('_mux_final_output', mux)]:
         monkeypatch.setattr(scene_blur, name, replacement)
@@ -510,8 +511,31 @@ def test_scene_mute_pipeline_reads_cached_audio_not_original_tracks(monkeypatch,
         force_whole_file_video=True))
     assert staged.parent == tmp_path/'out'
     assert staged.read_bytes() == b'finished edit'
-    assert calls == ['split', 'mute']
+    assert calls == ['continuous']
     assert list(source.parent.iterdir()) == [source]
+
+
+def test_empty_scene_regeneration_stream_copies_pristine_video(monkeypatch, tmp_path):
+    from app.mux import scene_blur
+    source = tmp_path/'source.mkv'
+    source.write_bytes(b'pristine video')
+    async def probe(*args):
+        return {'streams': [{'codec_type': 'video', 'codec_name': 'h264'}, {'codec_type': 'audio'}],
+                'format': {'duration': '10'}}
+    async def mux(**options):
+        assert options['concatenated_video_path'] == source
+        assert options['concatenated_audio_path'] is None
+        options['out_path'].write_bytes(b'clean regenerated edit')
+    async def forbidden(*args, **options):
+        raise AssertionError('No scene windows must not encode or split video')
+    monkeypatch.setattr(scene_blur, 'probe', probe)
+    monkeypatch.setattr(scene_blur, '_mux_final_output', mux)
+    monkeypatch.setattr(scene_blur, '_probe_keyframe_timestamps', forbidden)
+    result = run(scene_blur.build_blurred_video(video_path=source, blur_intervals=[], mute_intervals=[],
+        ffmpeg_bin='ffmpeg', ffprobe_bin='ffprobe', video_crf=23, video_preset='fast',
+        work_dir=tmp_path/'work', staging_dir=tmp_path/'out'))
+    assert result.read_bytes() == b'clean regenerated edit'
+    assert source.read_bytes() == b'pristine video'
 
 
 def test_source_track_indices_survive_repeated_external_runs(monkeypatch, tmp_path):

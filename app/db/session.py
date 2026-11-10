@@ -19,6 +19,16 @@ from app.wordlist_defaults import DEFAULT_WORDLIST
 # that already exists, so already-deployed databases need an explicit
 # ALTER TABLE for each of these, run once at startup.
 _COLUMNS_ADDED_LATER = [
+    ("titles", "scene_policy_applied", "VARCHAR(64)"),
+    ("titles", "scene_set_applied", "VARCHAR(64)"),
+    ("titles", "scene_analysis", "TEXT"),
+    ("detected_scenes", "audio_override", "BOOLEAN"),
+    ("detected_scenes", "action_override", "VARCHAR(20)"),
+    ("detected_scenes", "category_evidence", "TEXT"),
+    ("detected_scenes", "detector_evidence", "TEXT"),
+    ("titles", "scene_scan_generation", "INTEGER"),
+    ("detected_scenes", "scan_generation", "INTEGER"),
+    ("scene_jobs", "keep_manual", "BOOLEAN NOT NULL DEFAULT 0"),
     ("titles", "series_title", "VARCHAR(512)"),
     ("titles", "season_number", "INTEGER"),
     ("titles", "episode_number", "INTEGER"),
@@ -55,6 +65,7 @@ _DISPLAY_NAME_EPISODE_RE = re.compile(r"^(?P<series>.+) - S(?P<season>\d+)E(?P<e
 
 async def _run_column_migrations(conn: AsyncConnection) -> None:
     table_columns: dict[str, set[str]] = {}
+    preserve_legacy_audio = False
     for table, column, ddl_type in _COLUMNS_ADDED_LATER:
         if table not in table_columns:
             result = await conn.execute(text(f"PRAGMA table_info({table})"))
@@ -62,6 +73,12 @@ async def _run_column_migrations(conn: AsyncConnection) -> None:
         if column not in table_columns[table]:
             await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
             table_columns[table].add(column)
+            if table == "detected_scenes" and column == "audio_override":
+                # Old booleans cannot reveal whether a user deliberately chose
+                # them. Preserve both values, never reinterpret False as inherit.
+                preserve_legacy_audio = True
+    if preserve_legacy_audio:
+        await conn.execute(text("UPDATE detected_scenes SET audio_override = mute_audio"))
 
 
 async def _run_severity_vocabulary_migration(conn: AsyncConnection) -> None:
@@ -177,7 +194,12 @@ async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 # seeded here from the environment on first run, then fully owned by the
 # Settings page from then on -- editing them there no longer requires a
 # redeploy/restart.
+from app.scenes.content_policy import DEFAULT_POLICY
+
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "scene_content_policy": DEFAULT_POLICY,
+    "scene_semantic_enabled": False,
+    "scene_semantic_window_seconds": 10.0,
     # Empty roots preserve legacy in-place audio and sibling blur behavior.
     "movie_output_folder": "",
     "tv_output_folder": "",

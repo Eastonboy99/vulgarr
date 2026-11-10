@@ -5,23 +5,28 @@ scene-detection plan for why this doesn't share Title.status/ProcessingJob."""
 
 import datetime
 import hashlib
+import json
 import logging
 import shutil
+import secrets
 from dataclasses import dataclass
+from importlib.metadata import version, PackageNotFoundError
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audio.mute import MuteInterval
 from app.common.intervals import merge_intervals
 from app.config import settings as app_settings
-from app.db.models import DetectedScene, Title
+from app.db.models import DetectedScene, Title, SceneJob, JobState
 from app.db.session import get_setting
 from app.domain import SceneReviewStatus
 from app.mux.remux import ProgressCallback, StageCallback, probe
 from app.mux.scene_blur import apply_blur
+from app.scenes.content_policy import Action, VISUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
+from app.vision.content_classifier import scan_content_windows, classify_window
 from app.vision.claude_verify import top_score_timestamps, verify_candidate
 from app.vision.classifier import scan_video_frames, scan_window_frames
 from app.vision.scene_cluster import (
@@ -65,7 +70,14 @@ def _scan_fingerprint(video_path: Path, frame_interval_seconds: float, duration:
     resume, blindly trusting the old checkpoint's timestamps would silently
     corrupt them rather than just costing a little redundant work -- treated
     as fully stale and wiped instead."""
-    payload = repr((str(video_path), frame_interval_seconds, round(duration, 1)))
+    stat = video_path.stat() if video_path.exists() else None
+    try:
+        detector_version = version("nudenet")
+    except PackageNotFoundError:
+        detector_version = "3.4.2"  # Pinned identically in app/worker requirements.
+    payload = repr(("nudenet-scores-v2", detector_version, str(video_path),
+                    (stat.st_size, stat.st_mtime_ns) if stat else None,
+                    frame_interval_seconds, round(duration, 1)))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -153,12 +165,11 @@ async def scan_for_scenes(
 ) -> ScanOutcome:
     """Scan title's video for candidate explicit-content scenes.
 
-    Replaces any prior pending/rejected candidates from an earlier scan --
-    approved or already-applied ones represent a human decision (or a real edit
-    already baked into the sibling file) and must never be silently discarded by
-    a re-scan. A candidate that happens to overlap an already-approved scene on
-    re-scan is not deduplicated here -- left for the review UI (Phase 2) to
-    surface sensibly, not a data-integrity concern at this layer.
+    Builds candidates entirely in memory, then atomically replaces the prior
+    scene set, including approved and manual windows by default. A job's
+    explicit keep_manual flag preserves only manual windows. Progress commits
+    cannot publish partial results. The durable requested generation fences
+    late, cancelled, or superseded scans before any row is removed.
 
     job_id keys the resumable checkpoint file (app_settings.data_dir /
     "scan_work" / str(job_id) / "scores.jsonl") the main frame scan uses --
@@ -198,6 +209,10 @@ async def scan_for_scenes(
     if not fingerprint_path.exists() or fingerprint_path.read_text().strip() != fingerprint:
         resume_scores_path.unlink(missing_ok=True)
         fingerprint_path.write_text(fingerprint)
+
+    if bool(await get_setting(session, "scene_semantic_enabled")):
+        return await _scan_semantic(session, title, job_id, scan_work_dir,
+                                    fingerprint, duration, on_progress, on_stage)
 
     scores = await scan_video_frames(
         video_path,
@@ -309,14 +324,7 @@ async def scan_for_scenes(
             else:
                 claude_reasons[i] = "Verification failed -- left for manual review"
 
-    stale = await session.execute(
-        select(DetectedScene).where(
-            DetectedScene.title_id == title.id,
-            DetectedScene.status.in_([SceneReviewStatus.pending, SceneReviewStatus.rejected]),
-        )
-    )
-    for row in stale.scalars().all():
-        await session.delete(row)
+    staged_rows: list[DetectedScene] = []
 
     # scene_auto_process controls whether a fresh candidate lands as
     # already-approved (the default -- see the setting's own comment in
@@ -338,8 +346,8 @@ async def scan_for_scenes(
     # -- fall back to pending, since those are real unknowns, not verdicts.
     now = datetime.datetime.utcnow()
     auto_approved_count = need_review_count = 0
-    for candidate, (start, end, frac), confirmed, reason, mute_audio in zip(
-        candidates, refined, claude_confirmed, claude_reasons, claude_mute_audio
+    for candidate, (start, end, frac), confirmed, reason, mute_audio, window_scores in zip(
+        candidates, refined, claude_confirmed, claude_reasons, claude_mute_audio, all_window_scores
     ):
         auto_approve = auto_process and (not claude_verify_enabled or confirmed is True)
         claude_rejected = claude_verify_enabled and confirmed is False
@@ -351,20 +359,30 @@ async def scan_for_scenes(
             status = SceneReviewStatus.pending
         auto_approved_count += int(status == SceneReviewStatus.approved)
         need_review_count += int(status == SceneReviewStatus.pending)
-        session.add(
+        staged_rows.append(
             DetectedScene(
+                # Avoid SQLite rowid reuse: stale review forms must never
+                # address a replacement row after a complete reset.
+                id=secrets.randbits(62) + 1,
                 title_id=title.id,
+                scan_generation=job_id,
                 start_seconds=start,
                 end_seconds=end,
                 peak_confidence=candidate.peak_confidence,
                 verified_fraction=frac,
+                detector_evidence=json.dumps({
+                    "schema_version": 2, "backend": "nudenet", "semantic_coverage": [],
+                    "samples": [{"timestamp": s.timestamp, "detections": s.detections}
+                        for s in (window_scores or [s for s in scores if start <= s.timestamp <= end])
+                        if s.detections is not None],
+                }),
                 claude_verify_reason=reason,
                 mute_audio=mute_audio,
                 status=status,
                 reviewed_at=now if status != SceneReviewStatus.pending else None,
             )
         )
-    await session.commit()
+    await _activate_scan(session, title.id, job_id, staged_rows)
 
     # Full success -- the checkpoint has served its purpose. A future scan
     # (even a manual rescan of this same title) gets a new job_id and thus a
@@ -373,6 +391,93 @@ async def scan_for_scenes(
 
     return ScanOutcome(candidate_count=len(candidates), auto_approved_count=auto_approved_count,
                        need_review_count=need_review_count)
+
+
+async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
+                         rows: list[DetectedScene], analysis: dict | None = None) -> None:
+    """Swap a staged generation in one fenced transaction, with no callbacks.
+
+    Job completion is part of activation, so replaying an already successful
+    generation cannot overwrite later human review decisions. Interrupted jobs
+    retain their identity and checkpoint but never partially visible scenes.
+    """
+    job = await session.get(SceneJob, job_id, populate_existing=True)
+    fence = await session.execute(update(Title).where(
+        Title.id == title_id, Title.scene_scan_generation == job_id,
+        select(SceneJob.id).where(SceneJob.id == job_id,
+            SceneJob.state.in_([JobState.queued, JobState.processing])).exists(),
+    ).values(scene_scan_status="scanned" if rows else "no_scenes_found"))
+    if not fence.rowcount:
+        await session.rollback()
+        raise ValueError("Scene scan was cancelled, completed or superseded; previous results retained")
+    conditions = [DetectedScene.title_id == title_id]
+    if job.keep_manual:
+        conditions.append(DetectedScene.source != "manual")
+    previous = await session.execute(select(DetectedScene).where(*conditions))
+    for scene in previous.scalars():
+        await session.delete(scene)
+    for row in rows:
+        if row.id is None:
+            row.id = secrets.randbits(62) + 1
+    session.add_all(rows)
+    title = await session.get(Title, title_id)
+    title.scene_analysis = json.dumps(analysis or {"schema_version": 1, "backend": "legacy-exposure", "coverage": []})
+    job.state = JobState.done
+    job.finished_at = datetime.datetime.utcnow()
+    await session.commit()
+
+
+async def _scan_semantic(session, title, job_id, work_dir, fingerprint, duration,
+                         on_progress, on_stage) -> ScanOutcome:
+    """Broad opt-in proposals, independent of scalar exposure detections.
+
+    Retain all observed labels, including currently allowed categories, so a
+    later policy change can reuse evidence rather than repeat paid model calls.
+    Failed windows abort the swap and preserve the last successful scene set.
+    """
+    if on_stage is not None:
+        await on_stage("Sampling clothing/nudity across the whole title (external vision API)")
+    windows = await scan_content_windows(
+        video_path=Path(title.video_path), duration=duration,
+        window_seconds=float(await get_setting(session, "scene_semantic_window_seconds")),
+        checkpoint_dir=work_dir, fingerprint=fingerprint,
+        base_url=await get_setting(session, "claude_vision_base_url"),
+        api_key=await get_setting(session, "claude_vision_api_key"),
+        model=await get_setting(session, "claude_vision_model"),
+        ffmpeg_bin=app_settings.ffmpeg_bin, on_progress=on_progress,
+    )
+    auto_process = bool(await get_setting(session, "scene_auto_process"))
+    policy = await get_setting(session, "scene_content_policy")
+    rows = []
+    approved = pending = 0
+    for start, end, evidence in windows:
+        if not evidence["labels"] and not evidence["uncertain"]:
+            continue
+        scene = DetectedScene(id=secrets.randbits(62) + 1, title_id=title.id,
+            scan_generation=job_id, start_seconds=start, end_seconds=end,
+            peak_confidence=max(evidence["labels"].values(), default=0.0),
+            category_evidence=json.dumps(evidence), mute_audio=False,
+            source="detected")
+        decision = scene_decision(scene, policy)
+        # Eligibility is NOT review status: allowed evidence can become blocking
+        # later without losing observations or inventing a manual rejection.
+        scene.status = (SceneReviewStatus.approved if auto_process and not decision.needs_review
+                        else SceneReviewStatus.pending)
+        if scene.status == SceneReviewStatus.approved:
+            approved += 1
+            scene.reviewed_at = datetime.datetime.utcnow()
+        else:
+            pending += 1
+        rows.append(scene)
+    await _activate_scan(session, title.id, job_id, rows, analysis={
+        "schema_version": 1, "backend": "semantic-sampled-frames",
+        "coverage": sorted(VISUAL_CATEGORIES), "windows": len(windows),
+        "window_seconds": float(await get_setting(session, "scene_semantic_window_seconds")),
+        "model": await get_setting(session, "claude_vision_model"),
+        "scanned_at": datetime.datetime.utcnow().isoformat(),
+    })
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return ScanOutcome(len(rows), approved, pending)
 
 
 async def apply_scene_blur(
@@ -424,8 +529,14 @@ async def apply_scene_blur(
         )
     )
     scenes = result.scalars().all()
-    if not scenes:
-        raise ValueError("No approved scenes to blur")
+    policy = await get_setting(session, "scene_content_policy")
+    render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
+    set_revision = scene_set_fingerprint(scenes, policy, render_settings)
+    requested_generation = getattr(title, "scene_scan_generation", None)
+    decisions = {s.id: scene_decision(s, policy) for s in scenes}
+    scenes = [s for s in scenes if decisions[s.id].action != Action.allow]
+    # Empty effective sets deliberately rebuild from source/clean master,
+    # removing previously applied blur/mute windows after policy changes.
 
     # Padded before merging (not after) -- a fixed safety margin against
     # boundary imprecision in an already-approved scene (a detected/adjusted
@@ -461,7 +572,7 @@ async def apply_scene_blur(
     )
     blur_intervals = [MuteInterval(start=s, end=e) for s, e in blur_merged]
 
-    mute_scenes = [s for s in scenes if s.mute_audio]
+    mute_scenes = [s for s in scenes if decisions[s.id].mute_audio]
     mute_intervals: list[MuteInterval] = []
     if mute_scenes:
         mute_merged = merge_intervals(
@@ -516,6 +627,27 @@ async def apply_scene_blur(
                 raise ValueError('Cached clean audio is missing or the source changed. Reprocess audio before applying scenes.')
             output_options['audio_source_path'] = audio_master
 
+    async def validate_current_set() -> None:
+        """Reject stale queued/running Apply work before touching published media."""
+        # Hold SQLite's writer reservation through publication and the caller's
+        # commit. Review/settings writes cannot slip between validation and swap.
+        lock = await session.execute(update(Title).where(
+            Title.id == title.id, Title.scene_scan_generation == requested_generation,
+        ).values(scene_scan_status=Title.scene_scan_status))
+        if not lock.rowcount:
+            raise ValueError("Scene generation changed during Apply; previous edit retained")
+        current = (await session.execute(select(DetectedScene).where(
+            DetectedScene.title_id == title.id,
+        ).execution_options(populate_existing=True))).scalars().all()
+        current_policy = await get_setting(session, "scene_content_policy")
+        current_render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
+        current_generation = (await session.execute(select(Title.scene_scan_generation).where(
+            Title.id == title.id))).scalar_one()
+        if (current_generation != requested_generation
+                or policy_fingerprint(current_policy) != policy_fingerprint(policy)
+                or scene_set_fingerprint(current, current_policy, current_render_settings) != set_revision):
+            raise ValueError("Scene decisions or policy changed during Apply; previous published edit retained")
+
     final_path = await apply_blur(
         video_path=Path(title.video_path),
         **output_options,
@@ -530,11 +662,14 @@ async def apply_scene_blur(
         blur_power=blur_power,
         on_progress=video_progress,
         on_stage=on_stage,
+        before_publish=validate_current_set,
     )
 
     now = datetime.datetime.utcnow()
     title.vulgarr_edit_path = str(final_path)
     title.vulgarr_edit_generated_at = now
+    title.scene_policy_applied = policy_fingerprint(policy)
+    title.scene_set_applied = set_revision
     for scene in scenes:
         scene.applied_at = now
 
@@ -546,7 +681,7 @@ async def apply_scene_blur(
     stale_applied = await session.execute(
         select(DetectedScene).where(
             DetectedScene.title_id == title.id,
-            DetectedScene.status != SceneReviewStatus.approved,
+            DetectedScene.id.not_in([s.id for s in scenes]),
             DetectedScene.applied_at.is_not(None),
         )
     )
@@ -588,6 +723,11 @@ async def reverify_scenes_with_claude(
     endpoint hiccuped) but still records the failure in claude_verify_reason so it's
     visible which scenes still need an actual look.
     """
+    semantic_enabled = bool(await get_setting(session, "scene_semantic_enabled"))
+    legacy_enabled = bool(await get_setting(session, "claude_vision_verify_enabled"))
+    if not semantic_enabled and not legacy_enabled:
+        raise ValueError("External scene analysis is disabled; enable it explicitly in Settings")
+    policy = await get_setting(session, "scene_content_policy")
     claude_base_url = await get_setting(session, "claude_vision_base_url")
     claude_api_key = await get_setting(session, "claude_vision_api_key")
     claude_model = await get_setting(session, "claude_vision_model")
@@ -604,6 +744,28 @@ async def reverify_scenes_with_claude(
     failed_count = 0
     now = datetime.datetime.utcnow()
     for i, scene in enumerate(scenes):
+        if scene.category_evidence or semantic_enabled:
+            # Never feed structured clothing evidence back through a yes/no
+            # nudity prompt (which explicitly allows swimwear).
+            try:
+                if not semantic_enabled:
+                    raise ValueError("Structured analysis requires semantic opt-in")
+                evidence = await classify_window(base_url=claude_base_url, api_key=claude_api_key,
+                    model=claude_model, ffmpeg_bin=app_settings.ffmpeg_bin,
+                    video_path=Path(title.video_path), start=scene.start_seconds, end=scene.end_seconds)
+                scene.category_evidence = json.dumps(evidence)
+                decision = scene_decision(scene, policy)
+                if scene.source != "manual" and scene.action_override is None:
+                    scene.status = SceneReviewStatus.pending if decision.needs_review else SceneReviewStatus.approved
+                scene.reviewed_at = now
+                approved_count += int(scene.status == SceneReviewStatus.approved)
+            except ValueError:
+                scene.claude_verify_reason = "Structured verification failed; evidence not replaced"
+                failed_count += 1
+            await session.commit()
+            if on_progress is not None:
+                await on_progress(i + 1, len(scenes))
+            continue
         verify_result = await verify_candidate(
             base_url=claude_base_url,
             api_key=claude_api_key,

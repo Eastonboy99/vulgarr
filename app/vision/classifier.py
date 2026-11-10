@@ -270,7 +270,10 @@ def _load_resume_scores(path: Path) -> list[FrameScore]:
             continue
         try:
             obj = json.loads(line)
-            scores.append(FrameScore(timestamp=float(obj["t"]), confidence=float(obj["c"])))
+            detections = obj.get("detections") if obj.get("schema_version") == 2 else None
+            if detections is not None:
+                _validate_remote_detections(detections)
+            scores.append(FrameScore(timestamp=float(obj["t"]), confidence=float(obj["c"]), detections=detections))
         except Exception:
             continue
     return scores
@@ -498,6 +501,8 @@ async def _scan_frames(
                     expected = effective_start_offset + offset + i * frame_interval_seconds
                     if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
                         raise ValueError('Invalid remote score')
+                    if score.get('schema_version') == 2:
+                        _validate_remote_detections(score.get('detections'))
                 remote_ok += count
                 extraction_parts[number] = duration
                 extracted_fraction = sum(extraction_parts.values()) / remaining_duration
@@ -598,12 +603,13 @@ async def _scan_frames(
                             detections = await _detect(path, _local_detect)
                         else:
                             detections = results[position]
-                        score = FrameScore(timestamp=ts, confidence=frame_confidence(detections))
+                        _validate_remote_detections(detections)
+                        score = FrameScore(timestamp=ts, confidence=frame_confidence(detections), detections=detections)
                         async with progress_lock:
                             scores.append(score)
                             if resume_scores_path is not None:
                                 with resume_scores_path.open('a') as fh:
-                                    fh.write(json.dumps({'t': ts, 'c': score.confidence}) + '\n')
+                                    fh.write(json.dumps({'schema_version': 2, 't': ts, 'c': score.confidence, 'detections': score.detections}) + '\n')
                     except Exception:
                         logger.warning('Scene frame failed at %.2fs', ts, exc_info=True)
                     completed_overall += 1
@@ -625,12 +631,15 @@ async def _scan_frames(
             tmp, chunk_abs_start = item
             if tmp is None:
                 for raw in chunk_abs_start:
-                    score = FrameScore(timestamp=float(raw['t']), confidence=float(raw['c']))
+                    detections = raw.get('detections') if raw.get('schema_version') == 2 else None
+                    if detections is not None:
+                        _validate_remote_detections(detections)
+                    score = FrameScore(timestamp=float(raw['t']), confidence=float(raw['c']), detections=detections)
                     async with progress_lock:
                         scores.append(score)
                         if resume_scores_path is not None:
                             with resume_scores_path.open('a') as fh:
-                                fh.write(json.dumps({'t': score.timestamp, 'c': score.confidence}) + '\n')
+                                fh.write(json.dumps({'schema_version': 2, 't': score.timestamp, 'c': score.confidence, 'detections': score.detections}) + '\n')
                     completed_overall += 1
                     await report(f"Classifying {already_done_units + completed_overall}/{expected_total} frames")
                 slots.release()
