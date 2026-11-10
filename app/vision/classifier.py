@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 import httpx
@@ -39,6 +40,9 @@ def _classifier_urls() -> list[str]:
     return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
 
 
+# Context-local mutable counters are inherited by this scan's child tasks,
+# never shared with another concurrently running title scan.
+_scan_remote_counts = ContextVar('scan_remote_counts', default=None)
 _remote_rr = itertools.count()
 _remote_client: httpx.AsyncClient | None = None
 _remote_client_lock = threading.Lock()
@@ -65,10 +69,22 @@ async def _detect(frame_path: Path, local_detector_callable) -> list[dict]:
                     f"{url}/detect", files={"frame": (frame_path.name, fh, "image/jpeg")}
                 )
             if resp.status_code == 200:
-                return resp.json().get("detections", [])
+                detections = resp.json()['detections']
+                if not isinstance(detections, list):
+                    raise ValueError('Invalid remote detections')
+                confidence = frame_confidence(detections)
+                if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                    raise ValueError('Invalid remote confidence')
+                counts = _scan_remote_counts.get()
+                if counts is not None:
+                    counts['ok'] += 1
+                return detections
             logger.warning("Remote classifier %s returned HTTP %d -- falling back to local", url, resp.status_code)
         except Exception:
             logger.warning("Remote classifier %s unreachable -- falling back to local CPU", url, exc_info=True)
+    counts = _scan_remote_counts.get()
+    if urls and counts is not None:
+        counts['fallback'] += 1
     return await asyncio.to_thread(local_detector_callable, str(frame_path))
 # --------------------------------------------------------------------------------
 
@@ -341,8 +357,8 @@ async def _scan_frames(
     resume_scores_path, when given (only scan_video_frames' whole-file caller
     does -- scan_window_frames' per-candidate passes are already cheap enough
     not to need this), makes the scan resumable across a process restart: the
-    remaining span is processed in _SCAN_CHUNK_SECONDS chunks (extract, then
-    classify+checkpoint that chunk, before starting the next), each
+    remaining span is processed in _SCAN_CHUNK_SECONDS chunks (extract N+1
+    while classifying/checkpointing N, at most two chunks resident), each
     classified frame appended to the file as an independent JSON line as soon
     as it completes, and a prior run's *trusted contiguous* checkpoint (see
     _resumable_prefix -- concurrent completion means the raw file can have
@@ -384,10 +400,11 @@ async def _scan_frames(
     classify_units = max(1, remaining_units - extract_units)
     total_frames_remaining = max(1, round(remaining_duration / frame_interval_seconds))
 
-    # Only the resumable whole-file path chunks -- scan_window_frames (no
-    # resume_scores_path) keeps its original single-pass behavior exactly,
-    # since its clips are already short enough not to need this.
-    chunk_size = min(_SCAN_CHUNK_SECONDS, remaining_duration) if (resume_scores_path is not None or remote_extract_enabled()) else remaining_duration
+    # Remote requests are bounded even for dense window scans. Local windows
+    # retain their original single pass; resumable title scans always chunk.
+    chunk_size = (min(_SCAN_CHUNK_SECONDS, remaining_duration)
+                  if resume_scores_path is not None or remote_extract_enabled()
+                  else remaining_duration)
 
     # Local detector is loaded lazily: when SPF_CLASSIFIER_URLS is set and the
     # workers stay healthy, nudenet/onnxruntime is never imported on this host
@@ -412,16 +429,9 @@ async def _scan_frames(
     # classify work, so it doesn't undo the parallelism.
     progress_lock = asyncio.Lock()
     completed_overall = 0
-    # Seconds of remaining_duration whose extraction has *fully* completed,
-    # across all prior chunks -- updated only after a chunk's extraction
-    # finishes, so classify_one's progress contribution (below) reflects how
-    # much extraction is actually done so far, not the whole scan's total
-    # extraction budget the moment any classification starts at all (a real
-    # bug caught live: reusing the single-pass formula's `+ extract_units`
-    # unconditionally made progress jump straight to ~60% as soon as the
-    # first chunk's classification began, since extract_units there meant
-    # "all extraction, ever," not "this chunk's share").
-    extraction_seconds_done = 0.0
+    # Extraction progress uses the actual completed chunk fraction, not the
+    # whole extraction budget at the first classified frame. The high-water
+    # mark below prevents interleaved producer/consumer reports regressing.
 
     # A bounded producer owns tempdirs until the consumer has checkpointed
     # their frames. Two slots mean exactly current + next, not an unbounded
@@ -445,12 +455,12 @@ async def _scan_frames(
             progress_high_water = max(progress_high_water, min(done, expected_total))
             if on_status is not None:
                 fps = completed_overall / max(0.001, time.monotonic() - started)
-                await on_status(f"{phase} · remote {remote_ok} · fallback {remote_fallback} · {fps:.1f} fps · {in_flight} in flight")
+                await on_status(f"{phase} · remote {remote_ok + individual_counts['ok']} · fallback {remote_fallback + individual_counts['fallback']} · {fps:.1f} fps · {in_flight} in flight")
             if on_progress is not None:
                 await on_progress(progress_high_water, expected_total)
 
     async def produce():
-        nonlocal extracted_fraction, remote_ok, remote_fallback
+        nonlocal extracted_fraction, remote_ok, remote_fallback, in_flight
         offset = 0.0
         try:
             for number in range(chunk_count):
@@ -458,6 +468,7 @@ async def _scan_frames(
                 duration = min(chunk_size, remaining_duration - offset)
                 remote_scores = None
                 if remote_extract_enabled():
+                    in_flight += 1
                     await report(f"Extracting chunk {number + 1}/{chunk_count} (remote)")
                     try:
                         urls = _classifier_urls()
@@ -487,6 +498,8 @@ async def _scan_frames(
                         # request URL, and source capabilities are credentials.
                         logger.warning('Remote extraction failed; retrying local extraction')
                         remote_fallback += max(1, round(duration / frame_interval_seconds))
+                    finally:
+                        in_flight -= 1
                 tmp = tempfile.TemporaryDirectory()
                 owned_dirs.append(tmp)
                 async def extraction_progress(fraction):
@@ -535,7 +548,9 @@ async def _scan_frames(
                             raise ValueError('incomplete batch response')
                         # Validate before trusting any part of the response.
                         for result in results:
-                            frame_confidence(result)
+                            confidence = frame_confidence(result)
+                            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                                raise ValueError('Invalid batch confidence')
                         remote_ok += len(items)
                     except Exception:
                         logger.warning('Batch classifier failed; retrying individual frames', exc_info=True)
@@ -545,8 +560,6 @@ async def _scan_frames(
                     try:
                         if results is None:
                             detections = await _detect(path, _local_detect)
-                            if urls:
-                                remote_fallback += 1
                         else:
                             detections = results[position]
                         score = FrameScore(timestamp=ts, confidence=frame_confidence(detections))
@@ -562,6 +575,8 @@ async def _scan_frames(
             finally:
                 in_flight -= 1
 
+    individual_counts = {'ok': 0, 'fallback': 0}
+    counts_token = _scan_remote_counts.set(individual_counts)
     producer = asyncio.create_task(produce())
     try:
         while True:
@@ -596,6 +611,7 @@ async def _scan_frames(
         await asyncio.gather(producer, return_exceptions=True)
         for tmp in owned_dirs:
             tmp.cleanup()
+        _scan_remote_counts.reset(counts_token)
     return scores
 
 
