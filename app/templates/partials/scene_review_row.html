@@ -25,8 +25,13 @@
 
     {% if scene.claude_verify_reason %}
       <div class="muted scene-review-claude" title="Verdict from the optional Claude Vision precision filter, see Settings">
+        {% if scene.claude_verify_reason.startswith('YES:') %}<span class="badge badge-done">VLM confirmed</span>{% endif %}
+        {% if scene.claude_verify_reason.startswith('NO:') %}<span class="badge badge-rejected">VLM rejected</span>{% endif %}
+        {% if scene.mute_audio %}<span class="badge badge-queued">audio muted on apply</span>{% endif %}
         Claude Vision: {{ scene.claude_verify_reason }}
       </div>
+    {% elif claude_vision_verify_enabled %}
+      <div class="muted scene-review-claude">Not verified</div>
     {% endif %}
 
     <div class="scene-review-adjust">
