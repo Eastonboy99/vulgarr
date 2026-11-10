@@ -28,6 +28,10 @@ _latency = 0.0
 _RENDER_TIMEOUT = 24 * 60 * 60
 _RESULT_TTL = 3600
 _MAX_JOBS = 2
+# NVDEC downloads NV12/P010 frames. boxblur on the deployed FFmpeg 4.4 build
+# corrupts the right half of their chroma while enabled unless converted to
+# the source's canonical planar format first. Advertise this fix to clients.
+FILTER_LAYOUT = 'planar-v1'
 
 
 class RenderRequest(BaseModel):
@@ -72,8 +76,17 @@ def _command(params: RenderRequest, output: Path, backend: str, cuda_decode: boo
     cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error', '-progress', 'pipe:1']
     if cuda_decode:
         cmd += ['-hwaccel', 'cuda']
+    # Do not let boxblur operate directly on NVDEC's semiplanar NV12/P010
+    # download. Explicitly convert to the ffprobe source format (e.g.
+    # yuv420p/yuv420p10le); this preserves chroma sampling and bit depth, unlike
+    # forcing every movie through 8-bit yuv420p. Keep the conversion outside
+    # the enable window so switching blur on/off never changes frame layout.
+    # The incoming graph was validated before submission; the intermediate
+    # label cannot collide with its restricted vb/vb_stageN labels.
+    graph = (f'[0:v]format=pix_fmts={params.pix_fmt}[vulgarr_planar];'
+             + params.filter_complex.replace('[0:v]', '[vulgarr_planar]'))
     cmd += ['-rw_timeout', '30000000', '-i', params.source_url,
-            '-filter_complex', params.filter_complex, '-map', '[vb]']
+            '-filter_complex', graph, '-map', '[vb]']
     if backend == 'NVENC':
         codec = 'hevc_nvenc' if params.source_codec in {'hevc', 'h265'} else 'h264_nvenc'
         cmd += ['-c:v', codec, '-preset', 'p4', '-rc', 'vbr', '-cq', str(params.crf), '-b:v', '0']
@@ -200,7 +213,7 @@ def render_stats() -> dict:
     return {'render_requests_served': _completed, 'render_latency_seconds': _latency,
             'render_in_flight': sum(j['state'] == 'running' for j in _jobs.values()),
             'render_queued': sum(j['state'] == 'queued' for j in _jobs.values()),
-            'whole_video_render': True}
+            'whole_video_render': True, 'render_filter_layout': FILTER_LAYOUT}
 
 
 def _get(identity: str) -> dict:
@@ -233,7 +246,7 @@ async def start_render(params: RenderRequest):
            'params': params, 'directory': directory, 'output': Path(directory.name)/'video.mkv'}
     _jobs[identity] = job
     job['task'] = asyncio.create_task(_render(job))
-    return {'id': identity}
+    return {'id': identity, 'filter_layout': FILTER_LAYOUT}
 
 
 @router.get('/render/{identity}')

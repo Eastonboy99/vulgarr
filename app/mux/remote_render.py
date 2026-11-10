@@ -18,6 +18,11 @@ from app.vision.remote_source import remote_source_enabled, source_url
 
 logger = logging.getLogger(__name__)
 _POLL_SECONDS = 2.0
+_REQUIRED_FILTER_LAYOUT = 'planar-v1'
+
+
+class IncompatibleRenderWorker(RuntimeError):
+    """Controlled local diagnostic, never a worker-supplied error string."""
 
 
 async def try_remote_render(*, video_path, out_path, source_codec, source_video,
@@ -63,10 +68,13 @@ async def try_remote_render(*, video_path, out_path, source_codec, source_video,
                 'filter_complex': filter_complex,
             })
             response.raise_for_status()
-            candidate = response.json()['id']
+            acknowledgement = response.json()
+            candidate = acknowledgement['id']
             if not isinstance(candidate, str) or not re.fullmatch('[a-f0-9]{32}', candidate):
                 raise ValueError('Invalid worker render ID')
             identity = candidate
+            if acknowledgement.get('filter_layout') != _REQUIRED_FILTER_LAYOUT:
+                raise IncompatibleRenderWorker('worker is missing planar blur fix; rebuild worker image')
             while True:
                 response = await client.get(f'{url}/render/{identity}')
                 response.raise_for_status()
@@ -115,7 +123,10 @@ async def try_remote_render(*, video_path, out_path, source_codec, source_video,
         except Exception as exc:
             # Never log request bodies or exception strings from worker data:
             # the source URL inside the JSON body is a bearer capability.
-            reason = f'HTTP {exc.response.status_code}' if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            if isinstance(exc, IncompatibleRenderWorker):
+                reason = str(exc)  # Fixed local text, not untrusted response data.
+            else:
+                reason = f'HTTP {exc.response.status_code}' if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
             logger.warning('Remote whole-file blur failed (%s); using server CPU', reason)
             if on_stage:
                 await on_stage(f'Remote whole-file blur failed ({reason}) — server CPU fallback')

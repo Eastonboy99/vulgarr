@@ -1422,8 +1422,13 @@ def _blur_job_fingerprint(
     output -- used to detect a work_dir left by a *different* plan (approved
     scenes changed between attempts, settings changed, etc.) so a resume
     never silently reuses segment files that don't actually match the plan
-    being run now. Not a security hash, just a cheap change-detector."""
+    being run now. The recipe version also invalidates outputs from workers
+    predating the planar-layout fix: those videos decode cleanly despite
+    corrupt chroma, so decoder verification alone cannot reject their cache.
+    This affects blur intermediates only, never scan scores.jsonl checkpoints.
+    Not a security hash, just a cheap change-detector."""
     payload = repr((
+        'planar-blur-v1',
         str(video_path),
         [(iv.start, iv.end) for iv in blur_intervals],
         [(iv.start, iv.end) for iv in mute_intervals],

@@ -58,6 +58,7 @@ def test_worker_job_renders_remotely_and_download_cleans_artifacts(worker, monke
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://worker') as client:
                 response = await client.post('/render', json=payload())
                 assert response.status_code == 202
+                assert response.json()['filter_layout'] == worker.FILTER_LAYOUT
                 identity = response.json()['id']
                 for _ in range(20):
                     await asyncio.sleep(0)
@@ -230,7 +231,7 @@ def test_render_source_capability_covers_job_deadline(monkeypatch, tmp_path):
     assert query['signature'][0] == remote_source.source_signature(query['path'][0], 90100)
 
 
-@pytest.mark.parametrize('failure', [None, 'worker', 'validation', 'bad_progress'])
+@pytest.mark.parametrize('failure', [None, 'worker', 'validation', 'bad_progress', 'legacy_worker'])
 def test_host_polls_downloads_validates_and_keeps_previous_output_on_failure(monkeypatch, tmp_path, failure):
     configure_client(monkeypatch)
     monkeypatch.setenv('SPF_REMOTE_ENCODE_URL', 'http://user:worker-secret@worker')
@@ -241,7 +242,10 @@ def test_host_polls_downloads_validates_and_keeps_previous_output_on_failure(mon
     async def handle(request):
         requests.append((request.method, request.url.path))
         if request.method == 'DELETE': return httpx.Response(200, json={'ok': True})
-        if request.method == 'POST': return httpx.Response(202, json={'id': identity})
+        if request.method == 'POST':
+            acknowledgement = {'id': identity}
+            if failure != 'legacy_worker': acknowledgement['filter_layout'] = render.FILTER_LAYOUT
+            return httpx.Response(202, json=acknowledgement)
         if request.url.path.endswith('/output'): return httpx.Response(200, content=b'worker-video')
         return httpx.Response(200, json={'state': 'failed' if failure == 'worker' else 'done',
             'progress': 'NaN' if failure == 'bad_progress' else 1, 'backend': 'NVENC'})
@@ -261,6 +265,9 @@ def test_host_polls_downloads_validates_and_keeps_previous_output_on_failure(mon
     assert not out.with_name(out.name+'.remote.tmp').exists()
     assert any('whole-file' in message for message in stages)
     assert all('worker-secret' not in message for message in stages)
+    if failure == 'legacy_worker':
+        assert any('missing planar blur fix' in message for message in stages)
+        assert ('GET', '/render/'+identity+'/output') not in requests
 
 
 def test_missing_source_transport_is_explained_without_silent_local_selection(monkeypatch, tmp_path):
@@ -288,6 +295,47 @@ def test_worker_software_codec_and_options_match_source(codec, encoder, tmp_path
         assert 'ultrafast' not in command  # Not a valid native/SVT/VPx preset.
 
 
+@pytest.mark.parametrize('pix_fmt', ['yuv420p', 'yuv420p10le'])
+@pytest.mark.parametrize('cuda', [True, False])
+@pytest.mark.parametrize('batched', [True, False])
+def test_blur_normalizes_frame_layout_before_any_enable_window(pix_fmt, cuda, batched, tmp_path):
+    from app.mux.scene_blur import build_blur_filter
+    from app.audio.mute import MuteInterval
+    values = payload()
+    values['pix_fmt'] = pix_fmt
+    values['filter_complex'] = build_blur_filter(
+        [MuteInterval(i, i+.5) for i in range(100 if batched else 1)], '0:v', 'vb')
+    render.validate_blur_filter(values['filter_complex'])
+    command = render._command(render.RenderRequest(**values), tmp_path/'out', 'NVENC', cuda)
+    graph = command[command.index('-filter_complex')+1]
+    prefix = f'[0:v]format=pix_fmts={pix_fmt}[vulgarr_planar];'
+    assert graph == prefix + values['filter_complex'].replace('[0:v]', '[vulgarr_planar]', 1)
+    assert graph.count('[0:v]') == 1
+    assert command[command.index('-pix_fmt')+1] == pix_fmt
+    assert 'enable=' not in prefix  # Conversion remains active across boundaries.
+
+
+def test_planar_fix_invalidates_old_blur_cache_not_scan_checkpoint(tmp_path):
+    import hashlib
+    from app.mux.scene_blur import _blur_job_fingerprint, _reset_stale_work_dir
+    from app.audio.mute import MuteInterval
+    source = tmp_path/'original.mkv'
+    args = (source, [MuteInterval(2, 3)], [], 23, 'fast', 90, 8, '192k')
+    legacy = hashlib.sha256(repr((str(source), [(2, 3)], [], 23, 'fast', 90, 8, '192k')).encode()).hexdigest()[:16]
+    current = _blur_job_fingerprint(*args)
+    assert current != legacy
+    blur_cache = tmp_path/'blur_work'/'1'
+    blur_cache.mkdir(parents=True)
+    (blur_cache/'fingerprint.txt').write_text(legacy)
+    (blur_cache/'concatenated_wholefile.mkv').write_bytes(b'bad green video')
+    scan_checkpoint = tmp_path/'scan_work'/'1'/'scores.jsonl'
+    scan_checkpoint.parent.mkdir(parents=True)
+    scan_checkpoint.write_text('preserved scores')
+    _reset_stale_work_dir(blur_cache, current)
+    assert not (blur_cache/'concatenated_wholefile.mkv').exists()
+    assert scan_checkpoint.read_text() == 'preserved scores'
+
+
 def test_host_cancellation_cancels_worker_job(monkeypatch, tmp_path):
     configure_client(monkeypatch)
     started = asyncio.Event()
@@ -297,7 +345,7 @@ def test_host_cancellation_cancels_worker_job(monkeypatch, tmp_path):
         if request.method == 'DELETE':
             deleted.append(request.url.path)
             return httpx.Response(200)
-        if request.method == 'POST': return httpx.Response(202, json={'id': identity})
+        if request.method == 'POST': return httpx.Response(202, json={'id': identity, 'filter_layout': render.FILTER_LAYOUT})
         started.set()
         await asyncio.Event().wait()
     async def validate(path): pass

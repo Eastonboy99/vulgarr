@@ -184,6 +184,41 @@ Worker failures and invalid output preserve the local CPU safety net and do
 not install a partial video checkpoint or overwrite the published edit. Network
 loss/host crash cannot resume a whole-video encode in place; it may be retried.
 
+### CUDA decode / green-half-screen fix
+
+FFmpeg 4.4's CUDA-decode path can hand semiplanar NV12/P010 frames to `boxblur`.
+On the deployed Ubuntu 22.04 build, this reproducibly zeroes the right half of
+both chroma planes **only while blur is enabled**. The result is a gray/green
+half-screen that can decode without any errors, so codec/duration/decode checks
+alone do not detect it.
+
+The worker explicitly converts to the original ffprobe pixel format **before**
+all blur enable windows (for example `format=pix_fmts=yuv420p10le` for Main10).
+GPU decoding and NVENC encoding remain enabled, without forcing 10-bit sources
+through 8-bit conversion. New clients require the worker acknowledgement
+`filter_layout: planar-v1`; older workers are cancelled and fall back locally
+instead of publishing their visually corrupt output. `/stats` advertises
+`render_filter_layout: planar-v1`, and the worker panel flags a missing fix.
+
+Rebuild/redeploy both images and **Apply scenes again** to regenerate affected
+edits, then reopen playback. Already-published files are not automatically
+rewritten. The blur recipe fingerprint invalidates old intermediates, but does
+not remove scan checkpoints or approved scene selections.
+
+An opt-in synthetic regression exercises CUDA and CPU decode through NVENC for
+8-bit H.264, 8-bit HEVC and 10-bit HEVC. It checks both chroma halves on every
+frame, including blur boundaries, and asserts that bit depth is retained:
+
+```bash
+SPF_TEST_RENDER_CONTAINERS=vulgarr-worker-worker-0-1,vulgarr-worker-worker-1-1 \\
+  python -m pytest tests/test_remote_render_gpu.py -q
+```
+
+It loads the repository's candidate renderer in an isolated diagnostic process
+inside each worker. It does **not** modify/restart the running service or prove
+that the deployed daemon has been upgraded; check `/stats` for that. Synthetic
+fixtures supplement, not replace, the real-media checklist below.
+
 ### Deployment validation (required before enabling production encode offload)
 
 The unit suite uses mocked inference/ffmpeg and does **not** establish real NVENC

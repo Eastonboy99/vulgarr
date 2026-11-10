@@ -7,6 +7,9 @@
         {{ worker.device }} · {{ worker.requests_served }} requests · {{ worker.avg_latency_ms | round(1) }} ms average
         {% if worker.whole_video_render %}
           · {{ worker.render_in_flight }} rendering · {{ worker.render_requests_served }} whole-video renders completed
+          {% if worker.render_filter_layout != 'planar-v1' %}
+            <span class="muted">· planar blur fix missing (rebuild worker)</span>
+          {% endif %}
         {% else %}
           <span class="muted">· whole-video recovery unsupported (rebuild worker)</span>
         {% endif %}
