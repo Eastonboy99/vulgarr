@@ -1,5 +1,7 @@
 # Scene reset, audio and content-policy implementation
 
+> **Historical initial-rollout report.** The follow-up [NudeNet content-preferences design](NUDENET_CONTENT_PREFERENCES.md) supersedes the menu/taxonomy, default scan UI and policy-schema descriptions below. The current menu exposes NudeNet's exact 18 body-part labels, not the initial semantic/disabled category list. Audio, atomic-scan and publication safeguards described here remain in place.
+
 ## Shipped behavior
 
 - **Process/Reprocess Video**, **Both**, single-title, season and show scan actions create a fresh job generation. All previous scene windows/review decisions, including approved and manual windows, are replaced **only after successful analysis**. The standalone scan form offers **Keep manual scenes**. Audio-only actions retain scene decisions.

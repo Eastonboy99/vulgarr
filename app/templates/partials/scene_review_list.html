@@ -44,8 +44,8 @@
     <p class="muted">Showing previous scene results while the replacement scan runs. Apply is unavailable until it finishes.</p>
   {% endif %}
   {% if policy_stale %}<p class="muted">Policy changed — review effective actions, then regenerate this title. Existing media has not changed.</p>{% endif %}
-  {% if legacy_evidence or needs_reanalysis %}<p class="muted">Missing clothing-category coverage: a fresh opt-in semantic scan is required. Policy changes cannot infer missing categories.</p>{% endif %}
-  {% if scene_analysis %}<p class="muted">Analysis: {{ scene_analysis.backend }}{% if scene_analysis.model %} · {{ scene_analysis.model }} · {{ scene_analysis.windows }} sampled windows ({{ scene_analysis.window_seconds }} seconds each). Unsampled shots may be missed.{% endif %}</p>{% endif %}
+  {% if legacy_evidence or needs_reanalysis %}<p class="muted">Missing detector-label coverage: run a fresh scan to apply current detection preferences. Policy changes cannot infer labels absent from old analysis.</p>{% endif %}
+  {% if scene_analysis %}<p class="muted">Analysis: {{ scene_analysis.backend }}{% if scene_analysis.model %} · {{ scene_analysis.model }}{% endif %}{% if scene_analysis.backend == 'nudenet' %} · {{ scene_analysis.frame_interval_seconds }}-second sampling interval.{% elif scene_analysis.windows %} · {{ scene_analysis.windows }} sampled windows ({{ scene_analysis.window_seconds }} seconds each).{% endif %} Unsampled shots may be missed.</p>{% endif %}
   {% for category, count in category_counts.items() %}<span class="badge">{{ category_labels[category][0] }}: {{ count }}</span>{% endfor %}
   {% if scenes %}
     <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/reset-scene-audio" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Clear all per-scene audio choices, including preserved legacy choices, and use global audio defaults? Media changes only after Apply.">

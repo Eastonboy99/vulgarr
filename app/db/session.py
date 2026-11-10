@@ -194,7 +194,7 @@ async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 # seeded here from the environment on first run, then fully owned by the
 # Settings page from then on -- editing them there no longer requires a
 # redeploy/restart.
-from app.scenes.content_policy import DEFAULT_POLICY
+from app.scenes.content_policy import DEFAULT_POLICY, validate_policy
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "scene_content_policy": DEFAULT_POLICY,
@@ -621,7 +621,8 @@ async def get_setting(session: AsyncSession, key: str) -> Any:
     row = await session.get(AppSetting, key)
     if row is None:
         return DEFAULT_SETTINGS.get(key)
-    return json.loads(row.value)
+    value = json.loads(row.value)
+    return validate_policy(value) if key == "scene_content_policy" else value
 
 
 async def set_setting(session: AsyncSession, key: str, value: Any) -> None:

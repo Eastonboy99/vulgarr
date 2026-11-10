@@ -17,7 +17,7 @@ from app.db.session import get_session, get_setting
 from app.domain import SceneJobKind, SceneReviewStatus
 from app.queue.scene_worker import scene_job_queue
 from app.scenes import scrub_proxy
-from app.scenes.content_policy import Action, CATEGORIES, VISUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
+from app.scenes.content_policy import Action, CATEGORIES, VISUAL_CATEGORIES, NUDENET_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
 from app.vision.classifier import extract_frame
 
 router = APIRouter(tags=["scenes"])
@@ -32,6 +32,8 @@ async def _scene_review_context(session, title_id: int) -> dict:
     scenes = scenes_result.scalars().all()
     policy = await get_setting(session, "scene_content_policy")
     render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
+    expected_coverage = (VISUAL_CATEGORIES if await get_setting(session, "scene_semantic_enabled") else
+                         {k for k in NUDENET_CATEGORIES if policy["actions"][k] != "allow"})
     category_counts = {}
     for scene in scenes:
         scene.effective_decision = scene_decision(scene, policy)
@@ -97,7 +99,7 @@ async def _scene_review_context(session, title_id: int) -> dict:
         "policy_stale": bool(title and title.vulgarr_edit_path and title.scene_policy_applied != policy_fingerprint(policy)),
         "scene_set_stale": bool(title and title.vulgarr_edit_path and title.scene_set_applied != scene_set_fingerprint(scenes, policy, render_settings)),
         "scene_analysis": json.loads(title.scene_analysis) if title and title.scene_analysis else None,
-        "needs_reanalysis": not (title and title.scene_analysis and set(json.loads(title.scene_analysis).get("coverage", [])) >= VISUAL_CATEGORIES),
+        "needs_reanalysis": not (title and title.scene_analysis and set(json.loads(title.scene_analysis).get("coverage", [])) >= expected_coverage),
         "legacy_evidence": any(not s.category_evidence and s.source != "manual" for s in scenes),
         "scene_scan_status": title.scene_scan_status if title else "not_scanned",
         "scenes": scenes,

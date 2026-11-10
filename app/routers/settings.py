@@ -8,6 +8,7 @@ from fastapi.templating import Jinja2Templates
 from app.db.session import get_session, get_setting, hash_password, set_setting
 from app.domain import PRECISE_MODES
 from app.scenes.content_policy import CATEGORIES, VISUAL_CATEGORIES, validate_policy
+from app.vision.nudenet_labels import NUDENET_LABELS, NUDENET_LABEL_DETAILS, NUDENET_GROUPS, category_id
 from app.mux.scene_blur import BLUR_LEVEL_PRESETS, blur_level_to_radius_power, radius_power_to_blur_level
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -78,6 +79,13 @@ async def _load_all() -> dict:
     # app.mux.scene_blur.BLUR_LEVEL_PRESETS for why: friendlier than exposing
     # boxblur's two independent parameters).
     level = radius_power_to_blur_level(int(values["scene_blur_radius"]), int(values["scene_blur_power"]))
+    values["scene_content_policy"] = validate_policy(values["scene_content_policy"])
+    values["nudenet_groups"] = [
+        {"id": group, "label": label, "description": description,
+         "categories": [{"id": category_id(raw), "raw": raw, "label": NUDENET_LABEL_DETAILS[raw][0]}
+                        for raw in NUDENET_LABELS if NUDENET_LABEL_DETAILS[raw][1] == group]}
+        for group, label, description in NUDENET_GROUPS
+    ]
     values["content_categories"] = CATEGORIES
     values["visual_categories"] = VISUAL_CATEGORIES
     values["scene_blur_level"] = level

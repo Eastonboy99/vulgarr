@@ -37,8 +37,16 @@ def test_policy_settings_roundtrip_export_import_and_validation(monkeypatch):
                     "scene_content_policy": json.dumps(policy)}
             response = await client.post("/settings", data=form)
             assert response.status_code == 200
-            assert "Global visual content policy" in response.text
-            assert "Unavailable" in response.text
+            assert "Content preferences" in response.text
+            assert "Local detector · 18 labels" in response.text
+            from app.vision.nudenet_labels import NUDENET_LABELS
+            assert response.text.count('data-policy-category="nudenet.') == 18
+            for label in NUDENET_LABELS:
+                assert f'data-policy-category="nudenet.{label}"' in response.text
+                assert f'for="policy-{label}"' in response.text
+            assert 'data-policy-category="nudenet.FEMALE_BREAST_COVERED"' in response.text
+            assert 'data-policy-category="clothing.bikini"' not in response.text
+            assert "Unavailable" not in response.text
             assert stored["scene_content_policy"] == policy
             exported = (await client.get("/settings/export")).json()
             assert exported["scene_content_policy"] == policy

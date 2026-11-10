@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 from contextvars import ContextVar
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -43,6 +44,22 @@ def _classifier_urls() -> list[str]:
 # Context-local mutable counters are inherited by this scan's child tasks,
 # never shared with another concurrently running title scan.
 _scan_remote_counts = ContextVar('scan_remote_counts', default=None)
+_selected_detection_labels = ContextVar('selected_detection_labels', default=None)
+
+
+@contextmanager
+def detection_labels(labels):
+    """Scope policy-selected proposal classes to one scan, including child tasks.
+
+    None preserves the legacy exposure-only API. A selected (possibly empty)
+    set requires real raw detections; old scalar-only remote scans fall back.
+    """
+    token = _selected_detection_labels.set(frozenset(labels))
+    try:
+        yield
+    finally:
+        _selected_detection_labels.reset(token)
+
 _remote_rr = itertools.count()
 _remote_client: httpx.AsyncClient | None = None
 _remote_client_lock = threading.Lock()
@@ -164,7 +181,9 @@ def frame_confidence(detections: list[dict]) -> float:
     classes that actually indicate exposure, 0.0 if none matched or the frame had
     no detections at all. Kept as a standalone function so it's testable without
     a real model."""
-    scores = [d["score"] for d in detections if d.get("class") in _EXPLICIT_CLASSES]
+    selected = _selected_detection_labels.get()
+    classes = _EXPLICIT_CLASSES if selected is None else selected
+    scores = [d["score"] for d in detections if d.get("class") in classes]
     return max(scores, default=0.0)
 
 
@@ -273,7 +292,10 @@ def _load_resume_scores(path: Path) -> list[FrameScore]:
             detections = obj.get("detections") if obj.get("schema_version") == 2 else None
             if detections is not None:
                 _validate_remote_detections(detections)
-            scores.append(FrameScore(timestamp=float(obj["t"]), confidence=float(obj["c"]), detections=detections))
+            if _selected_detection_labels.get() is not None and detections is None:
+                break  # Do not resume selected classes from legacy scalar data.
+            confidence = frame_confidence(detections) if detections is not None else float(obj["c"])
+            scores.append(FrameScore(timestamp=float(obj["t"]), confidence=confidence, detections=detections))
         except Exception:
             continue
     return scores
@@ -400,7 +422,8 @@ async def _scan_frames(
         # after it, instead of piling up alongside stale/ambiguous entries.
         if raw_scores:
             resume_scores_path.write_text(
-                "".join(json.dumps({"t": s.timestamp, "c": s.confidence}) + "\n" for s in resumed_scores)
+                "".join(json.dumps({"schema_version": 2, "t": s.timestamp, "c": s.confidence,
+                                    "detections": s.detections}) + "\n" for s in resumed_scores)
             )
 
     effective_start_offset = start_offset + resume_seconds
@@ -501,6 +524,8 @@ async def _scan_frames(
                     expected = effective_start_offset + offset + i * frame_interval_seconds
                     if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
                         raise ValueError('Invalid remote score')
+                    if _selected_detection_labels.get() is not None and score.get('schema_version') != 2:
+                        raise ValueError('Selected labels require raw detector evidence')
                     if score.get('schema_version') == 2:
                         _validate_remote_detections(score.get('detections'))
                 remote_ok += count
@@ -634,7 +659,8 @@ async def _scan_frames(
                     detections = raw.get('detections') if raw.get('schema_version') == 2 else None
                     if detections is not None:
                         _validate_remote_detections(detections)
-                    score = FrameScore(timestamp=float(raw['t']), confidence=float(raw['c']), detections=detections)
+                    confidence = frame_confidence(detections) if detections is not None else float(raw['c'])
+                    score = FrameScore(timestamp=float(raw['t']), confidence=confidence, detections=detections)
                     async with progress_lock:
                         scores.append(score)
                         if resume_scores_path is not None:

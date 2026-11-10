@@ -1,0 +1,71 @@
+<section class="content-policy" aria-labelledby="content-policy-title">
+  <header class="content-policy__header">
+    <div>
+      <p class="content-policy__eyebrow">Scene filtering</p>
+      <h2 id="content-policy-title">Content preferences</h2>
+      <p class="muted">Choose what to filter using NudeNet’s actual detector labels.</p>
+    </div>
+    <span class="content-policy__badge"><i class="ti ti-device-desktop" aria-hidden="true"></i> Local detector · 18 labels</span>
+  </header>
+
+  <div class="content-policy__notice">
+    <i class="ti ti-info-circle" aria-hidden="true"></i>
+    <p>NudeNet detects exposed or covered body parts—not specific clothing, sexual activity or room types.
+      A covered-breast label cannot distinguish a bikini from a low-cut shirt. Location alone never triggers filtering.</p>
+  </div>
+  {% if values.scene_semantic_enabled %}
+  <p class="content-policy__migration" role="status">Saving these preferences selects local NudeNet scanning instead of the previous external semantic backend. Previous semantic rules and evidence are retained for compatibility.</p>
+  {% endif %}
+  <input type="hidden" name="scene_semantic_enabled" value="false">
+  <input type="hidden" name="scene_semantic_window_seconds" value="{{ values.scene_semantic_window_seconds }}">
+  <input type="hidden" id="scene_content_policy" name="scene_content_policy" value='{{ values.scene_content_policy | tojson }}'>
+
+  <div class="content-policy__audio">
+    <div>
+      <h3>Audio default</h3>
+      <p class="muted">Mute sound during blurred scenes. Individual scene overrides still take priority.</p>
+    </div>
+    <label class="content-policy__audio-control" for="policy-mute-default">
+      <input type="checkbox" id="policy-mute-default" {% if values.scene_content_policy.mute_blurred_audio %}checked{% endif %}
+        onchange="var p=document.getElementById('scene_content_policy');var v=JSON.parse(p.value);v.mute_blurred_audio=this.checked;p.value=JSON.stringify(v)">
+      Mute blurred scenes
+    </label>
+  </div>
+
+  {% for group in values.nudenet_groups %}
+  <details class="content-policy__group" {% if group.id != 'other' %}open{% endif %}>
+    <summary><span>{{ group.label }} <span class="content-policy__count">{{ group.categories | length }}</span></span><i class="ti ti-chevron-down" aria-hidden="true"></i></summary>
+    <div class="content-policy__group-body">
+      <div class="content-policy__group-toolbar">
+        <p class="muted">{{ group.description }}</p>
+        <label class="content-policy__bulk-label" for="policy-group-{{ group.id }}">Set group
+          <select id="policy-group-{{ group.id }}" aria-label="Set all {{ group.label | lower }} actions"
+            onchange="this.closest('details').querySelectorAll('select[data-policy-category]').forEach(s=>{s.value=this.value;s.dispatchEvent(new Event('change'));})">
+            <option value="" selected disabled>Choose action…</option>
+            <option value="allow">Allow</option><option value="blur">Blur</option><option value="blur_mute">Blur + mute</option>
+          </select>
+        </label>
+      </div>
+      <div class="content-policy__categories">
+        {% for category in group.categories %}
+        <div class="content-policy__category">
+          <label for="policy-{{ category.raw }}"><span>{{ category.label }}</span><code>{{ category.raw }}</code></label>
+          <select id="policy-{{ category.raw }}" data-policy-category="{{ category.id }}" aria-label="Action for {{ category.label | lower }}"
+            onchange="var p=document.getElementById('scene_content_policy');var v=JSON.parse(p.value);v.actions[this.dataset.policyCategory]=this.value;p.value=JSON.stringify(v)">
+            {% for action, label in [('allow', 'Allow'), ('blur', 'Blur'), ('blur_mute', 'Blur + mute')] %}
+            <option value="{{ action }}" {% if values.scene_content_policy.actions[category.id] == action %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </details>
+  {% endfor %}
+
+  <footer class="content-policy__footer">
+    <p><strong>Allow</strong> leaves matching content unchanged. <strong>Blur</strong> uses the audio default above. <strong>Blur + mute</strong> requests both.</p>
+    <p class="muted">Changes are saved with the settings form below. Review existing evidence or scan a title, then explicitly regenerate its edit. Saving never rewrites your library. Older scalar-only scans need a fresh scan for per-label decisions.</p>
+    <a href="https://github.com/notAI-tech/NudeNet/tree/v3" target="_blank" rel="noopener noreferrer">NudeNet label reference <i class="ti ti-external-link" aria-hidden="true"></i></a>
+  </footer>
+</section>

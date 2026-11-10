@@ -25,10 +25,11 @@ from app.db.session import get_setting
 from app.domain import SceneReviewStatus
 from app.mux.remux import ProgressCallback, StageCallback, probe
 from app.mux.scene_blur import apply_blur
-from app.scenes.content_policy import Action, VISUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
+from app.scenes.content_policy import Action, VISUAL_CATEGORIES, NUDENET_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint, validate_policy, nudenet_evidence
+from app.vision.nudenet_labels import NUDENET_LABELS, category_id
 from app.vision.content_classifier import scan_content_windows, classify_window
-from app.vision.claude_verify import top_score_timestamps, verify_candidate
-from app.vision.classifier import scan_video_frames, scan_window_frames
+from app.vision.claude_verify import verify_candidate
+from app.vision.classifier import scan_video_frames, scan_window_frames, detection_labels
 from app.vision.scene_cluster import (
     boundary_touches_window_edge,
     cluster_scenes,
@@ -156,7 +157,17 @@ async def _refine_candidate_boundary(
     return start, end, frac, window_scores
 
 
-async def scan_for_scenes(
+async def scan_for_scenes(session: AsyncSession, title: Title, job_id: int,
+                          on_progress: ScanProgressCallback | None = None,
+                          on_stage: StageCallback | None = None) -> ScanOutcome:
+    """Apply the title scan's exact NudeNet proposal classes without global state."""
+    policy = validate_policy(await get_setting(session, "scene_content_policy"))
+    selected = [label for label in NUDENET_LABELS if policy["actions"][category_id(label)] != "allow"]
+    with detection_labels(selected):
+        return await _scan_for_scenes(session, title, job_id, on_progress, on_stage)
+
+
+async def _scan_for_scenes(
     session: AsyncSession,
     title: Title,
     job_id: int,
@@ -205,7 +216,10 @@ async def scan_for_scenes(
     scan_work_dir.mkdir(parents=True, exist_ok=True)
     resume_scores_path = scan_work_dir / "scores.jsonl"
     fingerprint_path = scan_work_dir / "fingerprint.txt"
+    policy = validate_policy(await get_setting(session, "scene_content_policy"))
+    selected = sorted(k for k in NUDENET_CATEGORIES if policy["actions"][k] != "allow")
     fingerprint = _scan_fingerprint(video_path, frame_interval, duration)
+    fingerprint += hashlib.sha256(repr(selected).encode()).hexdigest()[:16]
     if not fingerprint_path.exists() or fingerprint_path.read_text().strip() != fingerprint:
         resume_scores_path.unlink(missing_ok=True)
         fingerprint_path.write_text(fingerprint)
@@ -241,11 +255,9 @@ async def scan_for_scenes(
     # found. Falls back to the original coarse boundary if the dense re-scan
     # itself fails, or somehow finds nothing above threshold at all.
     refined: list[tuple[float, float, float | None]] = []
-    # Retained alongside `refined` so the optional Claude-verify step below can
-    # target the exact frames this dense re-scan itself found most convincing
-    # (see app.vision.claude_verify.top_score_timestamps), instead of blindly
-    # guessing at even-spaced timestamps across the window. Empty for a
-    # candidate whose verification pass failed.
+    # Retain dense raw observations alongside refined boundaries for exact
+    # per-label policy evidence. Empty if refinement failed; coarse raw samples
+    # are then used without fabricating semantic or body-part labels.
     all_window_scores: list[list] = []
     if candidates and on_stage is not None:
         await on_stage(f"Verifying {len(candidates)} candidate scene(s)")
@@ -271,92 +283,16 @@ async def scan_for_scenes(
         refined.append((start, end, frac))
         all_window_scores.append(window_scores)
 
-    # Optional precision filter, off by default (claude_vision_verify_enabled)
-    # -- asks a Claude-vision-capable endpoint for a yes/no verdict on each
-    # candidate's *refined* window, using it as an extra gate before
-    # auto-approval decides anything below. claude_confirmed stays None for
-    # every candidate when the setting is off, which the status-decision loop
-    # below treats identically to "not confirmed" -- this step only ever adds
-    # a stricter bar on top of auto_process, never approves anything by
-    # itself. See app.vision.claude_verify for the fail-safe-toward-manual-
-    # review contract on any request failure.
-    claude_verify_enabled = bool(await get_setting(session, "claude_vision_verify_enabled"))
-    claude_reasons: list[str | None] = [None] * len(candidates)
-    claude_confirmed: list[bool | None] = [None] * len(candidates)
-    # True only for a candidate Claude specifically flagged as sexual activity
-    # (not just nudity/exposure) -- wired straight into DetectedScene.mute_audio
-    # below. Stays False for the skip-high-confidence path (no Claude call
-    # means no signal either way) and for anything Claude never confirmed.
-    claude_mute_audio: list[bool] = [False] * len(candidates)
-    if claude_verify_enabled and candidates:
-        claude_base_url = await get_setting(session, "claude_vision_base_url")
-        claude_api_key = await get_setting(session, "claude_vision_api_key")
-        claude_model = await get_setting(session, "claude_vision_model")
-        claude_skip_above = float(await get_setting(session, "claude_vision_skip_above_fraction"))
-        if on_stage is not None:
-            await on_stage(f"Verifying {len(candidates)} candidate scene(s) with Claude Vision")
-        for i, (start, end, frac) in enumerate(refined):
-            # Cost optimization: a candidate this confident from NudeNet's own
-            # dense re-scan isn't the kind of borderline case this filter
-            # exists to catch (see claude_vision_skip_above_fraction) -- skip
-            # the paid call and treat it the same as a real "YES" verdict.
-            if frac is not None and frac >= claude_skip_above:
-                claude_confirmed[i] = True
-                claude_reasons[i] = f"Skipped -- NudeNet dense re-scan already {frac:.0%} confident"
-                continue
-            result = await verify_candidate(
-                base_url=claude_base_url,
-                api_key=claude_api_key,
-                model=claude_model,
-                ffmpeg_bin=app_settings.ffmpeg_bin,
-                video_path=video_path,
-                start=start,
-                end=end,
-                sample_timestamps=top_score_timestamps(all_window_scores[i]) or None,
-            )
-            if result is not None:
-                claude_confirmed[i] = result.confirmed
-                claude_mute_audio[i] = result.mute_audio
-                reason = f"{'YES' if result.confirmed else 'NO'}: {result.reason}".strip(": ")
-                if result.mute_audio:
-                    reason += " (sex scene -- audio muted)"
-                claude_reasons[i] = reason
-            else:
-                claude_reasons[i] = "Verification failed -- left for manual review"
-
+    # Raw NudeNet class choices drive approval. The legacy semantic prompt
+    # permits swimwear and must not veto explicitly selected body-part labels.
     staged_rows: list[DetectedScene] = []
-
-    # scene_auto_process controls whether a fresh candidate lands as
-    # already-approved (the default -- see the setting's own comment in
-    # DEFAULT_SETTINGS for why manual-review-first was dropped as this
-    # feature's launch default) or pending, same as before. When the Claude
-    # Vision precision filter is also on, it adds a stricter bar on top: a
-    # candidate only auto-approves if *both* auto_process is on and Claude
-    # confirmed it (claude_confirmed[i] is True). Either way this only decides
-    # the *scene's* status -- whether a blur job actually runs off the back of
-    # it is the scene_worker's call (it needs candidate_count from
-    # ScanOutcome, which isn't known until after this function returns).
-    #
-    # An explicit Claude "NO" is a considered verdict, not an unknown -- it
-    # rejects the candidate outright, the same as a human looking at it and
-    # clicking Reject, rather than leaving it sitting in the pending queue
-    # (which nobody routinely checks once auto_process is relied on). Only
-    # genuine "nothing actually looked at this" cases -- the filter disabled,
-    # or the request itself failing/timing out (confirmed is None either way)
-    # -- fall back to pending, since those are real unknowns, not verdicts.
     now = datetime.datetime.utcnow()
     auto_approved_count = need_review_count = 0
-    for candidate, (start, end, frac), confirmed, reason, mute_audio, window_scores in zip(
-        candidates, refined, claude_confirmed, claude_reasons, claude_mute_audio, all_window_scores
-    ):
-        auto_approve = auto_process and (not claude_verify_enabled or confirmed is True)
-        claude_rejected = claude_verify_enabled and confirmed is False
-        if auto_approve:
-            status = SceneReviewStatus.approved
-        elif claude_rejected:
-            status = SceneReviewStatus.rejected
-        else:
-            status = SceneReviewStatus.pending
+    for candidate, (start, end, frac), window_scores in zip(candidates, refined, all_window_scores):
+        samples = window_scores or [s for s in scores if start <= s.timestamp <= end]
+        evidence = nudenet_evidence(samples, confidence_threshold)
+        auto_approve = auto_process and evidence is not None and not evidence["uncertain"]
+        status = SceneReviewStatus.approved if auto_approve else SceneReviewStatus.pending
         auto_approved_count += int(status == SceneReviewStatus.approved)
         need_review_count += int(status == SceneReviewStatus.pending)
         staged_rows.append(
@@ -370,19 +306,28 @@ async def scan_for_scenes(
                 end_seconds=end,
                 peak_confidence=candidate.peak_confidence,
                 verified_fraction=frac,
+                category_evidence=json.dumps(evidence) if evidence is not None else None,
                 detector_evidence=json.dumps({
                     "schema_version": 2, "backend": "nudenet", "semantic_coverage": [],
                     "samples": [{"timestamp": s.timestamp, "detections": s.detections}
                         for s in (window_scores or [s for s in scores if start <= s.timestamp <= end])
                         if s.detections is not None],
                 }),
-                claude_verify_reason=reason,
-                mute_audio=mute_audio,
+                mute_audio=False,
                 status=status,
                 reviewed_at=now if status != SceneReviewStatus.pending else None,
             )
         )
-    await _activate_scan(session, title.id, job_id, staged_rows)
+    current_policy = validate_policy(await get_setting(session, "scene_content_policy"))
+    if selected != sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow"):
+        raise ValueError("Detection label preferences changed during scanning; run a fresh scan")
+    await _activate_scan(session, title.id, job_id, staged_rows, analysis={
+        "schema_version": 1, "backend": "nudenet", "model": "NudeNet 3.4.2",
+        # Only enabled labels proposed windows across the full title. Enabling
+        # another label later requires a fresh scan, not invented coverage.
+        "coverage": selected, "detector_categories": sorted(NUDENET_CATEGORIES),
+        "frame_interval_seconds": frame_interval,
+    })
 
     # Full success -- the checkpoint has served its purpose. A future scan
     # (even a manual rescan of this same title) gets a new job_id and thus a
@@ -410,6 +355,14 @@ async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
     if not fence.rowcount:
         await session.rollback()
         raise ValueError("Scene scan was cancelled, completed or superseded; previous results retained")
+    if analysis and analysis.get("backend") == "nudenet":
+        # The activation write reservation also fences settings changes, so
+        # newly enabled proposal classes cannot be missed by a late scan.
+        current_policy = validate_policy(await get_setting(session, "scene_content_policy"))
+        enabled = sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow")
+        if enabled != analysis["coverage"]:
+            await session.rollback()
+            raise ValueError("Detection label preferences changed during scanning; previous scenes retained")
     conditions = [DetectedScene.title_id == title_id]
     if job.keep_manual:
         conditions.append(DetectedScene.source != "manual")
@@ -744,6 +697,13 @@ async def reverify_scenes_with_claude(
     failed_count = 0
     now = datetime.datetime.utcnow()
     for i, scene in enumerate(scenes):
+        if scene.category_evidence and set(json.loads(scene.category_evidence)["coverage"]) == NUDENET_CATEGORIES:
+            # A legacy semantic verifier cannot reinterpret exact body-part
+            # choices. Fresh local scans update these detector observations.
+            approved_count += int(scene.status == SceneReviewStatus.approved)
+            if on_progress is not None:
+                await on_progress(i + 1, len(scenes))
+            continue
         if scene.category_evidence or semantic_enabled:
             # Never feed structured clothing evidence back through a yes/no
             # nudity prompt (which explicitly allows swimwear).

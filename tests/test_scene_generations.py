@@ -200,6 +200,58 @@ def test_stale_apply_is_fenced_before_publication(tmp_path, monkeypatch):
     run(scenario())
 
 
+def test_local_scan_uses_selected_covered_label_and_persists_real_evidence(tmp_path, monkeypatch):
+    import copy
+    import json
+    from types import SimpleNamespace
+    from app.scenes import pipeline
+    from app.scenes.content_policy import DEFAULT_POLICY, scene_decision, Action
+    from app.vision import classifier
+    from app.vision.scene_cluster import FrameScore
+    from app.db.session import set_setting
+    async def scenario():
+        engine, factory = await database(tmp_path)
+        detections = [{"class": "FEMALE_BREAST_COVERED", "score": .9}]
+        async def probe(*args):
+            return {"format": {"duration": "20"}}
+        async def scan(*args, **options):
+            return [FrameScore(t, classifier.frame_confidence(detections), detections) for t in (5, 5.5)]
+        async def refine(*args):
+            return (4.5, 6, 1.0, [FrameScore(5, .9, detections)])
+        async def forbidden(*args, **options):
+            raise AssertionError("Local label policy must not call a swimwear-allowing semantic verifier")
+        monkeypatch.setattr(pipeline, "probe", probe)
+        monkeypatch.setattr(pipeline, "scan_video_frames", scan)
+        monkeypatch.setattr(pipeline, "_refine_candidate_boundary", refine)
+        monkeypatch.setattr(pipeline, "verify_candidate", forbidden)
+        monkeypatch.setattr(pipeline, "app_settings", SimpleNamespace(data_dir=tmp_path, ffprobe_bin="ffprobe", ffmpeg_bin="ffmpeg"))
+        try:
+            async with factory() as session:
+                policy = copy.deepcopy(DEFAULT_POLICY)
+                policy["actions"]["nudenet.FEMALE_BREAST_COVERED"] = "blur_mute"
+                await set_setting(session, "scene_content_policy", policy)
+                await set_setting(session, "claude_vision_verify_enabled", True)
+                job = SceneJob(title_id=1, kind=SceneJobKind.scan, state=JobState.processing)
+                session.add(job)
+                await session.flush()
+                title = await session.get(Title, 1)
+                title.scene_scan_generation = job.id
+                await session.commit()
+                outcome = await pipeline.scan_for_scenes(session, title, job.id)
+                assert outcome.candidate_count == outcome.auto_approved_count == 1
+                row = (await session.execute(select(DetectedScene))).scalar_one()
+                assert json.loads(row.category_evidence)["labels"] == {"nudenet.FEMALE_BREAST_COVERED": .9}
+                assert scene_decision(row, policy).action == Action.blur_mute
+                policy["actions"]["nudenet.FEMALE_BREAST_COVERED"] = "allow"
+                assert scene_decision(row, policy).action == Action.allow
+                coverage = json.loads(title.scene_analysis)["coverage"]
+                assert "nudenet.FEMALE_BREAST_COVERED" in coverage
+                assert "nudenet.FACE_FEMALE" not in coverage
+        finally:
+            await engine.dispose()
+    run(scenario())
+
+
 def test_bulk_review_rejects_obsolete_generation(tmp_path):
     from app.routers.scenes import _claim_review_generation
     from types import SimpleNamespace

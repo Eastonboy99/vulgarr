@@ -1,34 +1,5 @@
 <form id="settings-form" hx-post="/settings" hx-target="#settings-form" hx-swap="outerHTML" novalidate>
-  <fieldset>
-    <legend>Global visual content policy</legend>
-    <p class="muted">Automated sampling can make mistakes and miss short shots. This is not human-curated coverage. Location alone (including a bathroom) never blocks content. Existing language settings remain independent. Saving does not scan or regenerate your library.</p>
-    <label><input type="checkbox" name="scene_semantic_enabled" {% if values.scene_semantic_enabled %}checked{% endif %}> Enable whole-title clothing/nudity analysis using the configured vision endpoint below. Sampled private frames leave this server; API charges may apply (3 images per window).</label>
-    <label>Sampling window (seconds; shorter costs more)
-      <input type="number" name="scene_semantic_window_seconds" min="1" max="30" step="1" value="{{ values.scene_semantic_window_seconds }}">
-    </label>
-    <p class="muted">Without this opt-in, local NudeNet provides legacy exposure candidates only—not bikini/neckline distinctions. Violence, sexual activity, medical content and self-harm analysis are unavailable in this policy backend.</p>
-    <input type="hidden" id="scene_content_policy" name="scene_content_policy" value='{{ values.scene_content_policy | tojson }}'>
-    <label><input type="checkbox" {% if values.scene_content_policy.mute_blurred_audio %}checked{% endif %}
-      onchange="var p=document.getElementById('scene_content_policy');var v=JSON.parse(p.value);v.mute_blurred_audio=this.checked;p.value=JSON.stringify(v)"> Mute audio whenever an enabled scene is blurred (unless overridden per scene)</label>
-    {% for group in ['nudity', 'clothing'] %}
-      <label>Set all {{ group }} categories
-        <select aria-label="Set all {{ group }} actions" onchange="this.closest('fieldset').querySelectorAll('select[data-policy-group={{ group }}]').forEach(s=>{s.value=this.value;s.dispatchEvent(new Event('change'));})">
-          <option value="" selected disabled>Choose group action…</option><option value="allow">Allow</option><option value="blur">Blur</option><option value="blur_mute">Blur + mute</option>
-        </select>
-      </label>
-    {% endfor %}
-    {% for category, info in values.content_categories.items() %}
-      <label>{{ info[0] }} {% if category not in values.visual_categories %}<small>Unavailable</small>{% endif %}
-        <select data-policy-group="{{ category.split('.')[0] }}" {% if category not in values.visual_categories %}disabled{% endif %}
-          onchange="var p=document.getElementById('scene_content_policy');var v=JSON.parse(p.value);v.actions['{{ category }}']=this.value;p.value=JSON.stringify(v)">
-          {% for action, label in [('allow', 'Allow'), ('blur', 'Blur'), ('blur_mute', 'Blur + mute')] %}
-          <option value="{{ action }}" {% if values.scene_content_policy.actions[category] == action %}selected{% endif %}>{{ label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-    {% endfor %}
-    <p class="muted">Example default: allow low-cut shirts and covered chest outlines; block bikinis, underwear and exposed anatomy. Old scene audio choices are preserved as overrides. Use “Use global audio defaults” on a title to explicitly clear them. After saving: review stored scene actions, rescan if evidence is legacy/unclassified, then explicitly regenerate that title.</p>
-  </fieldset>
+  {% include "partials/content_policy_settings.html" %}
   {% if output_folder_error %}<p role="alert" class="muted" style="color: var(--vulgarr-outdated-text);">{{ output_folder_error }}</p>{% endif %}
   <p>
     <button type="button" id="advanced-toggle-btn" class="secondary small" onclick="toggleAdvancedSettings()">Show advanced settings</button>
