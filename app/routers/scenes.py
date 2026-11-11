@@ -130,7 +130,8 @@ async def _claim_review_generation(session, request: Request, title_id: int) -> 
     return bool(claimed.rowcount)
 
 
-async def _render_scene_review(request: Request, title_id: int, detail_view: bool = False) -> HTMLResponse:
+async def _render_scene_review(request: Request, title_id: int, detail_view: bool = False,
+                               scene_reset_message: str | None = None) -> HTMLResponse:
     """Scene-review actions are reachable both from the standalone scene-review
     page/section (just this fragment) and embedded on the title detail page
     (where the Approve-all/Apply row now lives up in the Video column, outside
@@ -168,13 +169,14 @@ async def _render_scene_review(request: Request, title_id: int, detail_view: boo
                 "last_scan_job": last_scan_job,
                 "last_scan_job_duration": last_scan_job_duration,
                 "matched_cues": matched_cues,
+                "scene_reset_message": scene_reset_message,
                 **context,
             },
         )
     async with get_session() as session:
         context = await _scene_review_context(session, title_id)
     return templates.TemplateResponse(
-        "partials/scene_review_list.html", {"request": request, **context}
+        "partials/scene_review_list.html", {"request": request, "scene_reset_message": scene_reset_message, **context}
     )
 
 
@@ -209,6 +211,29 @@ async def scan_scenes(request: Request, title_id: int, detail_view: bool = Form(
                       keep_manual: bool = Form(False)):
     await scene_job_queue.enqueue_scan(title_id, keep_manual=keep_manual)
     return await _render_scene_review(request, title_id, detail_view)
+
+
+@router.post("/library/title/{title_id}/clear-and-restart-scenes", response_class=HTMLResponse)
+async def clear_and_restart_title_scenes(request: Request, title_id: int,
+    confirm_reset: bool = Form(False), detail_view: bool = Form(False),
+    row_view: bool = Form(False), short_label: bool = Form(False)):
+    """Destructively reset scene decisions, independently of audio reprocessing."""
+    if not confirm_reset:
+        raise HTTPException(400, "Confirm clearing all scene windows, including manual scenes")
+    result = await scene_job_queue.clear_and_restart_scans([title_id])
+    if result.missing:
+        raise HTTPException(404, "Title no longer exists")
+    if row_view:
+        from app.routers.library import _row_dict, _render_title, _pending_scene_title_ids
+        async with get_session() as session:
+            title = await session.get(Title, title_id)
+            if title is None:
+                raise HTTPException(404, "Title no longer exists")
+            version = int(await get_setting(session, "wordlist_version"))
+            pending = await _pending_scene_title_ids(session, [title_id])
+            row = _row_dict(title, version, short_label=short_label, has_pending_scenes=title_id in pending)
+        return await _render_title(request, row, False, scene_reset_message=result.message(), season_context=short_label)
+    return await _render_scene_review(request, title_id, detail_view, scene_reset_message=result.message())
 
 
 @router.post("/library/title/{title_id}/reverify-scenes-claude", response_class=HTMLResponse)
@@ -257,6 +282,27 @@ async def apply_scenes(request: Request, title_id: int, detail_view: bool = Form
 
 @router.post("/library/shows/{series_id}/scan-scenes", response_class=HTMLResponse)
 async def scan_scenes_show(request: Request, series_id: int, came_from: str | None = Form(default=None)):
+    return await _scan_show(request, series_id, came_from, clear=False)
+
+
+@router.post("/library/shows/{series_id}/clear-and-restart-scenes", response_class=HTMLResponse)
+async def clear_and_restart_show_scenes(request: Request, series_id: int,
+    confirm_reset: bool = Form(False), came_from: str | None = Form(default=None)):
+    """Clear/restart every available episode, reporting busy skipped titles."""
+    if not confirm_reset:
+        raise HTTPException(400, "Confirm clearing scenes for all episodes in this show")
+    return await _scan_show(request, series_id, came_from, clear=True)
+
+
+async def _queue_scan_action(title_ids: list[int], *, clear: bool) -> str:
+    """Shared single/bulk reset messaging, distinct from non-destructive scans."""
+    if clear:
+        return (await scene_job_queue.clear_and_restart_scans(title_ids)).message()
+    queued = await scene_job_queue.enqueue_scan_for_titles_if_not_already_active(title_ids)
+    return f"Queued {queued} episode(s) for scene scanning."
+
+
+async def _scan_show(request: Request, series_id: int, came_from: str | None, *, clear: bool):
     from app.db.models import MediaType
     from app.routers.library import SEVERITY_OPTIONS, _aggregate_show_pip, _load_seasons
 
@@ -265,14 +311,15 @@ async def scan_scenes_show(request: Request, series_id: int, came_from: str | No
             select(Title.id).where(Title.sonarr_series_id == series_id, Title.media_type == MediaType.episode)
         )
         title_ids = [row[0] for row in result.all()]
+    scan_message = await _queue_scan_action(title_ids, clear=clear)
+    # Reload after the reset/claim so counts and episode status reflect the
+    # cleared generation rather than the pre-click results.
+    async with get_session() as session:
         current_version = int(await get_setting(session, "wordlist_version"))
         series_title, poster_url, severity_levels, precise_mode, gating_message, seasons = await _load_seasons(
             session, series_id, current_version, came_from=came_from
         )
     pip, pip_label = _aggregate_show_pip(seasons)
-
-    queued = sum([await scene_job_queue.enqueue_scan_if_not_already_active(title_id) for title_id in title_ids])
-    scan_message = f"Queued {queued} episode(s) for scene scanning."
 
     return templates.TemplateResponse(
         "partials/show_detail_card.html",
@@ -302,6 +349,20 @@ async def scan_scenes_season(
     detail_view: bool = Form(False),
     came_from: str | None = Form(default=None),
 ):
+    return await _scan_season(request, series_id, season_number, detail_view, came_from, clear=False)
+
+
+@router.post("/library/shows/{series_id}/season/{season_number}/clear-and-restart-scenes", response_class=HTMLResponse)
+async def clear_and_restart_season_scenes(request: Request, series_id: int, season_number: int,
+    confirm_reset: bool = Form(False), detail_view: bool = Form(False), came_from: str | None = Form(default=None)):
+    """Season-scoped form of the explicit show reset."""
+    if not confirm_reset:
+        raise HTTPException(400, "Confirm clearing scenes for all episodes in this season")
+    return await _scan_season(request, series_id, season_number, detail_view, came_from, clear=True)
+
+
+async def _scan_season(request: Request, series_id: int, season_number: int,
+                       detail_view: bool, came_from: str | None, *, clear: bool):
     from app.db.models import MediaType
     from app.routers.library import SEVERITY_OPTIONS, _load_season, _load_season_detail_context
 
@@ -314,6 +375,8 @@ async def scan_scenes_season(
             )
         )
         title_ids = [row[0] for row in result.all()]
+    scan_message = await _queue_scan_action(title_ids, clear=clear)
+    async with get_session() as session:
         current_version = int(await get_setting(session, "wordlist_version"))
         if detail_view:
             context = await _load_season_detail_context(
@@ -321,9 +384,6 @@ async def scan_scenes_season(
             )
         else:
             season = await _load_season(session, series_id, season_number, current_version)
-
-    queued = sum([await scene_job_queue.enqueue_scan_if_not_already_active(title_id) for title_id in title_ids])
-    scan_message = f"Queued {queued} episode(s) for scene scanning."
 
     if detail_view:
         return templates.TemplateResponse(

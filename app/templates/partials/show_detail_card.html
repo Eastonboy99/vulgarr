@@ -16,6 +16,8 @@
             </div>
           </div>
           <div class="detail-actions">
+            {% from "partials/scene_reset_button.html" import scene_reset_button %}
+            {{ scene_reset_button("/library/shows/" ~ series_id ~ "/clear-and-restart-scenes", "#show-detail-" ~ series_id, scope="this show (all episodes)", came_from=came_from) }}
             {# Audio, Video, Both -- deliberate order everywhere this trio appears. #}
             <form hx-post="/library/shows/{{ series_id }}/process" hx-target="#show-detail-{{ series_id }}" hx-swap="outerHTML">
               <input type="hidden" name="came_from" value="{{ came_from or '' }}">

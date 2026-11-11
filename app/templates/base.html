@@ -315,6 +315,10 @@
        same as the rest of this table. Mobile restores wrap below, once the table has
        already reflowed into single-column cards with a full-width Process row. */
     .row-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: nowrap; }
+    .row-actions-with-reset { flex-wrap: wrap; }
+    .scene-reset-action { order: 1; }
+    .row-actions-with-reset .scene-reset-action { flex-basis: 100%; }
+    .detail-actions .scene-reset-action { flex: 0 0 100%; }
     details { margin-top: 1.5rem; }
     details:first-of-type { margin-top: 0; }
     summary { cursor: pointer; padding: 0.4rem 0; }

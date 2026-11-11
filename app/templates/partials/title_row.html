@@ -71,7 +71,9 @@
     </form>
   </td>
   <td data-label="Process" class="span-full">
-    <div class="row-actions">
+    <div class="row-actions row-actions-with-reset">
+      {% from "partials/scene_reset_button.html" import scene_reset_button %}
+      {{ scene_reset_button("/library/title/" ~ row.title.id ~ "/clear-and-restart-scenes", "#title-row-" ~ row.title.id, row_view=true, short_label=season_context) }}
       {# Audio, Video, Both -- deliberate order everywhere this trio appears. #}
       {% if row.status == 'awaiting_mkv' %}
         <span class="muted">waiting on Sonarr/Radarr…</span>
@@ -110,5 +112,6 @@
       </form>
       {% endif %}
     </div>
+    {% if scene_reset_message %}<p class="muted" role="status">{{ scene_reset_message }}</p>{% endif %}
   </td>
 </tr>

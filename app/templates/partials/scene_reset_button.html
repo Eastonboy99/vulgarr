@@ -1,0 +1,11 @@
+{% macro scene_reset_button(endpoint, target, scope='this title', detail_view=false, row_view=false, came_from=none, short_label=false) -%}
+<form class="inline scene-reset-action" hx-post="{{ endpoint }}" hx-target="{{ target }}" hx-swap="outerHTML"
+  hx-confirm="Clear all currently found scenes for {{ scope }} and restart scanning from zero? This deletes approved, rejected, pending and manual scene windows immediately. They will not be restored if the new scan fails. Existing published edits stay unchanged until a validated regeneration succeeds. Titles with queued/running audio, Apply or verification work are skipped.">
+  <input type="hidden" name="confirm_reset" value="true">
+  {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
+  {% if row_view %}<input type="hidden" name="row_view" value="true">{% endif %}
+  {% if short_label %}<input type="hidden" name="short_label" value="true">{% endif %}
+  {% if came_from %}<input type="hidden" name="came_from" value="{{ came_from }}">{% endif %}
+  <button type="submit" class="small danger" title="Immediately clear scene windows and review decisions, including manual scenes, then run a new scan. Profanity/audio choices are unchanged."><i class="ti ti-refresh" aria-hidden="true"></i> Clear scenes &amp; restart scan</button>
+</form>
+{%- endmacro %}

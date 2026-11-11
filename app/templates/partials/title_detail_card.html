@@ -26,6 +26,8 @@
           <span id="detail-bazarr-indicator-{{ row.title.id }}" class="htmx-indicator detail-waiting"><span class="spinner"></span>Searching for subtitles…</span>
         </div>
         <div class="detail-actions">
+          {% from "partials/scene_reset_button.html" import scene_reset_button %}
+          {{ scene_reset_button("/library/title/" ~ row.title.id ~ "/clear-and-restart-scenes", "#title-detail-" ~ row.title.id, detail_view=true) }}
           {# Audio, Video, Both -- deliberate order everywhere this trio of actions
              appears (also show_detail_card.html, season_detail_card.html). #}
           {% if row.status == 'awaiting_mkv' %}
@@ -69,6 +71,7 @@
       </div>
     </div>
     <div class="detail-body">
+      {% if scene_reset_message %}<p class="muted" role="status">{{ scene_reset_message }}</p>{% endif %}
       <div class="detail-columns">
         {# Audio on the left, Video on the right -- deliberate placement, matches
            the Audio/Video/Both action-button order above. #}

@@ -11,11 +11,12 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from dataclasses import dataclass
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 
 from app.config import settings as app_settings
-from app.db.models import JobState, SceneJob, SceneJobKind, Title
+from app.db.models import JobState, SceneJob, SceneJobKind, Title, DetectedScene, ProcessingJob
 from app.db.session import get_session, get_setting
 from app.mux.tempfiles import sweep_interrupted_temp_files
 from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
@@ -47,6 +48,23 @@ def _format_eta(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {seconds}s remaining"
     return f"{seconds}s remaining"
+
+
+@dataclass(frozen=True)
+class SceneResetResult:
+    """Committed outcome of an explicit destructive reset, not a normal rescan."""
+    restarted: int = 0
+    cleared: int = 0
+    busy: int = 0
+    missing: int = 0
+
+    def message(self) -> str:
+        return (
+            f"Cleared {self.cleared} scene(s); restarted scanning from zero for {self.restarted} title(s). "
+            + (f"Skipped {self.busy} busy title(s) with queued/running audio, Apply or verification work. " if self.busy else "")
+            + (f"{self.missing} title(s) no longer available. " if self.missing else "")
+            + "Published edits are retained until a validated regeneration succeeds."
+        )
 
 
 class SceneJobQueue:
@@ -142,6 +160,71 @@ class SceneJobQueue:
                 title.scene_scan_status = "not_scanned"
             await session.commit()
         return True, None
+
+    async def clear_and_restart_scans(self, title_ids: list[int]) -> SceneResetResult:
+        """Explicitly clear current windows now and start new inference generations.
+
+        Unlike ordinary atomic rescans, this destructive action intentionally
+        leaves no current scene results even if subsequent inference fails.
+        Original media, published edits, clean masters and profanity decisions
+        are untouched. Existing scans are superseded transactionally; active
+        audio/render/verification jobs are skipped without deleting anything.
+        New job IDs guarantee fresh checkpoints rather than retry/resume.
+        """
+        new_jobs: list[int] = []
+        superseded: list[int] = []
+        cleared = busy = missing = 0
+        async with get_session() as session:
+            for title_id in sorted(set(title_ids)):
+                scene_busy = select(SceneJob.id).where(
+                    SceneJob.title_id == title_id, SceneJob.kind != SceneJobKind.scan,
+                    SceneJob.state.in_([JobState.queued, JobState.processing]),
+                ).exists()
+                audio_busy = select(ProcessingJob.id).where(
+                    ProcessingJob.title_id == title_id,
+                    ProcessingJob.state.in_([JobState.queued, JobState.processing]),
+                ).exists()
+                # Acquire the database writer reservation before checking and
+                # replacing the old generation. Concurrent Apply claims use the
+                # same Title write and cannot race this check/delete operation.
+                claim = await session.execute(update(Title).where(
+                    Title.id == title_id, ~scene_busy, ~audio_busy,
+                ).values(scene_scan_status="queued", scene_analysis=None))
+                if not claim.rowcount:
+                    if await session.get(Title, title_id) is None:
+                        missing += 1
+                    else:
+                        busy += 1
+                    continue
+                active = (await session.execute(select(SceneJob.id).where(
+                    SceneJob.title_id == title_id, SceneJob.kind == SceneJobKind.scan,
+                    SceneJob.state.in_([JobState.queued, JobState.processing]),
+                ))).scalars().all()
+                if active:
+                    await session.execute(update(SceneJob).where(SceneJob.id.in_(active)).values(
+                        state=JobState.cancelled, error="Superseded by Clear scenes & restart scan",
+                        finished_at=datetime.datetime.utcnow(),
+                    ))
+                    superseded.extend(active)
+                deleted = await session.execute(delete(DetectedScene).where(DetectedScene.title_id == title_id))
+                cleared += deleted.rowcount
+                job = SceneJob(title_id=title_id, kind=SceneJobKind.scan, state=JobState.queued,
+                    keep_manual=False, progress_message="Previous scenes cleared; fresh scan queued", progress_percent=0)
+                session.add(job)
+                await session.flush()
+                await session.execute(update(Title).where(Title.id == title_id)
+                                      .values(scene_scan_generation=job.id))
+                new_jobs.append(job.id)
+            await session.commit()
+        # Cancel local tasks only after the durable fence is installed. Other
+        # processes' old scans cannot activate against the replacement generation.
+        for job_id in superseded:
+            task = self._running.get(job_id)
+            if task is not None:
+                task.cancel()
+        for job_id in new_jobs:
+            await self._pending.put(job_id)
+        return SceneResetResult(len(new_jobs), cleared, busy, missing)
 
     async def enqueue_scan(self, title_id: int, *, keep_manual: bool = False) -> int:
         """Claim a fresh generation using a database write, not a check-then-insert.
@@ -464,6 +547,11 @@ class SceneJobQueue:
                 await session.rollback()
                 job = await session.get(SceneJob, job_id, populate_existing=True)
                 title = await session.get(Title, title_id, populate_existing=True)
+                if job.state == JobState.cancelled:
+                    # A reset from another process can fence activation without
+                    # cancelling this process's Task. Keep the intentional
+                    # cancellation result rather than relabeling it as a failure.
+                    return
                 logger.exception("Scene %s failed for title %s", job.kind.value, title_id)
                 job.state = JobState.failed
                 job.error = str(exc)

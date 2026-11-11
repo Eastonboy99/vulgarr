@@ -16,6 +16,8 @@
             </div>
           </div>
           <div class="detail-actions">
+            {% from "partials/scene_reset_button.html" import scene_reset_button %}
+            {{ scene_reset_button("/library/shows/" ~ series_id ~ "/season/" ~ season_number ~ "/clear-and-restart-scenes", "#season-detail-" ~ series_id ~ "-" ~ season_number, scope="this season (all episodes)", detail_view=true, came_from=came_from) }}
             {# Audio, Video, Both -- deliberate order everywhere this trio appears. #}
             <form hx-post="/library/shows/{{ series_id }}/season/{{ season_number }}/process" hx-target="#season-detail-{{ series_id }}-{{ season_number }}" hx-swap="outerHTML">
               <input type="hidden" name="detail_view" value="true">

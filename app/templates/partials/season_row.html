@@ -28,7 +28,9 @@
     </form>
   </td>
   <td data-label="Process" class="span-full">
-    <div class="row-actions">
+    <div class="row-actions row-actions-with-reset">
+      {% from "partials/scene_reset_button.html" import scene_reset_button %}
+      {{ scene_reset_button("/library/shows/" ~ series_id ~ "/season/" ~ season.season_number ~ "/clear-and-restart-scenes", "#season-row-" ~ season.season_number, scope="this season (all episodes)") }}
       {# Audio, Video, Both -- deliberate order everywhere this trio appears. #}
       <form hx-post="/library/shows/{{ series_id }}/season/{{ season.season_number }}/process" hx-target="#season-row-{{ season.season_number }}" hx-swap="outerHTML">
         <button type="submit" class="small secondary" title="Queue every episode in this season that already has a subtitle (word-list mute)">Audio</button>
