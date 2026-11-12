@@ -25,7 +25,7 @@ def test_v1_policy_upgrade_preserves_preferences_without_guessing_clothing():
     old["actions"]["nudity.breasts"] = "allow"
     old["actions"]["clothing.bikini"] = "blur_mute"
     upgraded = validate_policy(old)
-    assert upgraded["schema_version"] == 2
+    assert upgraded["schema_version"] == 3
     assert upgraded["actions"][category_id("FEMALE_BREAST_EXPOSED")] == "allow"
     assert upgraded["actions"][category_id("FEMALE_BREAST_COVERED")] == "allow"
     assert upgraded["actions"]["clothing.bikini"] == "blur_mute"

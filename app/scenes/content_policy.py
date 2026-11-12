@@ -13,7 +13,7 @@ from enum import Enum
 from app.vision.nudenet_labels import NUDENET_LABELS, NUDENET_LABEL_DETAILS, DEFAULT_BLOCKED_LABELS, category_id
 
 SCHEMA_VERSION = 1  # Evidence schema is independent of policy migrations.
-POLICY_SCHEMA_VERSION = 2
+POLICY_SCHEMA_VERSION = 3
 RENDER_SETTING_KEYS = (
     "scene_blur_radius", "scene_blur_power", "scene_blur_pad_start_seconds",
     "scene_blur_pad_end_seconds", "blur_video_crf", "blur_video_preset",
@@ -26,9 +26,9 @@ class Action(str, Enum):
     blur_mute = "blur_mute"
 
 
-# Stable ID -> (display label, capability). Only the first two capabilities
-# have an implemented semantic frame-analysis path. Temporal/transcript groups
-# remain unavailable rather than presenting working-looking controls.
+# Stable ID -> (display label, capability). Visual, NudeNet and local contextual
+# capabilities have implemented sampling paths. Temporal/transcript groups stay
+# unavailable rather than presenting working-looking controls.
 CATEGORIES = {
     "nudity.breasts": ("Exposed breasts", "visual"),
     "nudity.genitalia": ("Exposed genitalia", "visual"),
@@ -52,6 +52,8 @@ CATEGORIES = {
     "medical.non_graphic": ("Non-graphic medical / body processes", "unavailable"),
 }
 LEGACY_CATEGORIES = frozenset(CATEGORIES)
+CONTEXTUAL_CATEGORIES = frozenset({"nudity.contextual"})
+CATEGORIES["nudity.contextual"] = ("Contextual / obscured nudity (local AI)", "contextual")
 CATEGORIES.update({category_id(k): (NUDENET_LABEL_DETAILS[k][0], "nudenet") for k in NUDENET_LABELS})
 NUDENET_CATEGORIES = frozenset(category_id(k) for k in NUDENET_LABELS)
 VISUAL_CATEGORIES = frozenset(k for k, (_, capability) in CATEGORIES.items() if capability == "visual")
@@ -72,7 +74,7 @@ def validate_policy(value: dict) -> dict:
     """
     if not isinstance(value, dict) or set(value) != {"schema_version", "mute_blurred_audio", "actions"}:
         raise ValueError("Invalid content policy fields")
-    if type(value["schema_version"]) is not int or value["schema_version"] not in (1, POLICY_SCHEMA_VERSION):
+    if type(value["schema_version"]) is not int or value["schema_version"] not in (1, 2, POLICY_SCHEMA_VERSION):
         raise ValueError("Unsupported content policy schema")
     if type(value["mute_blurred_audio"]) is not bool:
         raise ValueError("Audio default must be Boolean")
@@ -85,11 +87,13 @@ def validate_policy(value: dict) -> dict:
             legacy = ("nudity.breasts" if "BREAST" in label else
                       "nudity.buttocks" if label == "BUTTOCKS_EXPOSED" else "nudity.genitalia")
             actions[category_id(label)] = actions[legacy]
+    if value["schema_version"] in (1, 2) and isinstance(actions, dict) and set(actions) == set(CATEGORIES) - CONTEXTUAL_CATEGORIES:
+        actions = {**DEFAULT_POLICY["actions"], **actions}
     if not isinstance(actions, dict) or set(actions) != set(CATEGORIES):
         raise ValueError("Policy must contain exactly the known category IDs")
     for category, action in actions.items():
         Action(action)
-        if category not in VISUAL_CATEGORIES | NUDENET_CATEGORIES and action != "allow":
+        if category not in VISUAL_CATEGORIES | NUDENET_CATEGORIES | CONTEXTUAL_CATEGORIES and action != "allow":
             raise ValueError(f"Category {category} has no qualified analysis backend")
     return {"schema_version": POLICY_SCHEMA_VERSION, "mute_blurred_audio": value["mute_blurred_audio"],
             "actions": dict(sorted(actions.items()))}
@@ -113,7 +117,7 @@ def validate_evidence(value: dict) -> dict:
         raise ValueError("Unsupported evidence schema")
     if type(value["uncertain"]) is not bool:
         raise ValueError("Uncertainty must be Boolean")
-    if not isinstance(value["coverage"], list) or set(value["coverage"]) not in (VISUAL_CATEGORIES, NUDENET_CATEGORIES):
+    if not isinstance(value["coverage"], list) or set(value["coverage"]) not in (VISUAL_CATEGORIES, NUDENET_CATEGORIES, CONTEXTUAL_CATEGORIES):
         raise ValueError("Incomplete detector category coverage")
     if not isinstance(value["labels"], dict) or not set(value["labels"]) <= set(value["coverage"]):
         raise ValueError("Unknown evidence label")
@@ -165,7 +169,7 @@ def resolve_action(policy: dict, evidence: dict | None, *, audio_override: bool 
         matched = [policy["actions"][k] for k, score in evidence["labels"].items() if score >= threshold]
         action = (Action.blur_mute if "blur_mute" in matched else
                   Action.blur if "blur" in matched else Action.allow)
-        review = evidence["uncertain"] or (set(evidence["coverage"]) == VISUAL_CATEGORIES
+        review = set(evidence["coverage"]) == CONTEXTUAL_CATEGORIES or evidence["uncertain"] or (set(evidence["coverage"]) == VISUAL_CATEGORIES
                     and any(0 < c < threshold for c in evidence["labels"].values()))
         reason = evidence["explanation"]
     if action != Action.allow:

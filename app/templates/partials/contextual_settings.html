@@ -1,0 +1,25 @@
+<h3 id="contextual-discovery">Contextual nudity discovery · local AI</h3>
+<input type="hidden" name="scene_contextual_present" value="true">
+<div class="checkbox-row-group">
+  <label class="checkbox-row"><input type="checkbox" name="scene_contextual_enabled" {% if values.scene_contextual_enabled %}checked{% endif %}> Discover contextual / obscured nudity across the whole video</label>
+  <div class="muted">An independent pass, not just a check of NudeNet hits. Looks for clearly unclothed people even when intimate areas are hidden by framing, pose or water. Combines newly found intervals with NudeNet results without duplicate overlapping scenes. New AI candidates always require human review, even with auto-process enabled.</div>
+</div>
+<label for="scene_contextual_base_url">Local vision API base URL</label>
+<div><input class="wide-input" type="url" id="scene_contextual_base_url" name="scene_contextual_base_url" value="{{ values.scene_contextual_base_url or values.claude_vision_base_url }}" placeholder="http://desktop-lan-ip:1234/v1">
+  <div class="muted">Use LM Studio's LAN address reachable from the application container, not localhost unless LM Studio runs there. Only loopback/private LAN addresses are accepted; public endpoints, redirects and environment proxies are blocked. A private endpoint must itself run inference locally, not proxy requests to a cloud service.</div></div>
+<label for="scene_contextual_model">Local vision model</label>
+<div><input class="wide-input" id="scene_contextual_model" name="scene_contextual_model" value="{{ values.scene_contextual_model }}">
+  <div class="muted">Recommended starting model: your downloaded Qwen3.5-4B vision model. Match its LM Studio API identifier and load it with a bounded context (8,192 tokens is a starting point). Requires image inputs, JSON-schema output and reasoning_effort=none. LM Studio manages loading and GPU placement; the application does not download models.</div></div>
+<label for="scene_contextual_api_key">Local API key (optional)</label>
+<input class="wide-input" type="password" id="scene_contextual_api_key" name="scene_contextual_api_key" value="{{ values.scene_contextual_api_key }}" autocomplete="off">
+<label for="scene_contextual_window_seconds">Sampling window (seconds)</label>
+<div><input class="input-sm" type="number" id="scene_contextual_window_seconds" name="scene_contextual_window_seconds" min="4" max="30" step="1" value="{{ values.scene_contextual_window_seconds }}">
+  <div class="muted">Four evenly spaced stills per window across the entire video; shorter windows sample more densely but cost more time. Unsampled short shots may be missed. Candidate boundaries cover sampled windows, not frame-exact nudity. CPU-only whole-movie scans can take many hours; benchmark GPU throughput before scanning a library.</div></div>
+<label for="scene_contextual_timeout_seconds">Request timeout (seconds)</label>
+<input class="input-sm" type="number" id="scene_contextual_timeout_seconds" name="scene_contextual_timeout_seconds" min="30" max="900" step="30" value="{{ values.scene_contextual_timeout_seconds }}">
+<label for="contextual-policy-action">Contextual nudity action after approval</label>
+<div><select id="contextual-policy-action" onchange="var p=document.getElementById('scene_content_policy');var v=JSON.parse(p.value);v.actions['nudity.contextual']=this.value;p.value=JSON.stringify(v)">
+  {% for action, label in [('allow', 'Allow'), ('blur', 'Blur only'), ('blur_mute', 'Blur + mute')] %}
+  <option value="{{ action }}" {% if values.scene_content_policy.actions['nudity.contextual'] == action %}selected{% endif %}>{{ label }}</option>
+  {% endfor %}
+</select><div class="muted">Separate from NudeNet's 18 real labels. Binary AI flags are not calibrated confidence scores. Ambiguous bare skin is sent to review, not treated as proven nudity; select a manual Blur override if you choose to filter an uncertain interval. Save, then run a fresh scan to add coverage. Merely saving does not start processing.</div></div>

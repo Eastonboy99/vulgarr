@@ -25,7 +25,7 @@ def test_policy_settings_roundtrip_export_import_and_validation(monkeypatch):
     for module in (settings, setup):
         monkeypatch.setattr(module, "get_session", session)
         monkeypatch.setattr(module, "set_setting", set_setting)
-    monkeypatch.setattr(settings, "get_setting", get_setting)
+        monkeypatch.setattr(module, "get_setting", get_setting)
     app = FastAPI()
     app.include_router(settings.router)
     app.include_router(setup.router)

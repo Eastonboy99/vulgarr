@@ -17,8 +17,9 @@ from app.db.session import get_session, get_setting
 from app.domain import SceneJobKind, SceneReviewStatus
 from app.queue.scene_worker import scene_job_queue
 from app.scenes import scrub_proxy
-from app.scenes.content_policy import Action, CATEGORIES, VISUAL_CATEGORIES, NUDENET_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
+from app.scenes.content_policy import Action, CATEGORIES, VISUAL_CATEGORIES, NUDENET_CATEGORIES, CONTEXTUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint
 from app.vision.classifier import extract_frame
+from app.vision import contextual
 
 router = APIRouter(tags=["scenes"])
 templates = Jinja2Templates(directory="app/templates")
@@ -34,6 +35,13 @@ async def _scene_review_context(session, title_id: int) -> dict:
     render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
     expected_coverage = (VISUAL_CATEGORIES if await get_setting(session, "scene_semantic_enabled") else
                          {k for k in NUDENET_CATEGORIES if policy["actions"][k] != "allow"})
+    context_enabled = bool(await get_setting(session, "scene_contextual_enabled"))
+    analysis = json.loads(title.scene_analysis) if title and title.scene_analysis else None
+    context_stale = False
+    if context_enabled:
+        expected_coverage = set(expected_coverage) | CONTEXTUAL_CATEGORIES
+        config = {key: await get_setting(session, key) for key in contextual.KEYS}
+        context_stale = not analysis or analysis.get("contextual_fingerprint") != contextual.config_fingerprint(config)
     category_counts = {}
     for scene in scenes:
         scene.effective_decision = scene_decision(scene, policy)
@@ -86,10 +94,12 @@ async def _scene_review_context(session, title_id: int) -> dict:
         if s.status == SceneReviewStatus.pending
         and s.verified_fraction is not None
         and s.verified_fraction >= high_confidence_fraction
+        and not s.effective_decision.needs_review
     )
     # What a "Reprocess with Claude Vision" click would actually touch -- see
     # reverify_scenes_with_claude, which skips already-rejected scenes.
-    claude_reverifiable_count = sum(1 for s in scenes if s.status != SceneReviewStatus.rejected)
+    claude_reverifiable_count = sum(1 for s in scenes if s.status != SceneReviewStatus.rejected
+        and (not s.category_evidence or set(json.loads(s.category_evidence)["coverage"]) == VISUAL_CATEGORIES))
 
     return {
         "title_id": title_id,
@@ -98,8 +108,8 @@ async def _scene_review_context(session, title_id: int) -> dict:
         "category_labels": CATEGORIES,
         "policy_stale": bool(title and title.vulgarr_edit_path and title.scene_policy_applied != policy_fingerprint(policy)),
         "scene_set_stale": bool(title and title.vulgarr_edit_path and title.scene_set_applied != scene_set_fingerprint(scenes, policy, render_settings)),
-        "scene_analysis": json.loads(title.scene_analysis) if title and title.scene_analysis else None,
-        "needs_reanalysis": not (title and title.scene_analysis and set(json.loads(title.scene_analysis).get("coverage", [])) >= expected_coverage),
+        "scene_analysis": analysis,
+        "needs_reanalysis": context_stale or not (analysis and set(analysis.get("coverage", [])) >= expected_coverage),
         "legacy_evidence": any(not s.category_evidence and s.source != "manual" for s in scenes),
         "scene_scan_status": title.scene_scan_status if title else "not_scanned",
         "scenes": scenes,
@@ -524,9 +534,11 @@ async def approve_high_confidence_scenes(request: Request, title_id: int, detail
             )
         )
         now = datetime.datetime.utcnow()
+        policy = await get_setting(session, "scene_content_policy")
         for scene in result.scalars().all():
-            scene.status = SceneReviewStatus.approved
-            scene.reviewed_at = now
+            if not scene_decision(scene, policy).needs_review:
+                scene.status = SceneReviewStatus.approved
+                scene.reviewed_at = now
         await session.commit()
     return await _render_scene_review(request, title_id, detail_view)
 

@@ -14,7 +14,7 @@
       A covered-breast label cannot distinguish a bikini from a low-cut shirt. Location alone never triggers filtering.</p>
   </div>
   {% if values.scene_semantic_enabled %}
-  <p class="content-policy__migration" role="status">Saving these preferences selects local NudeNet scanning instead of the previous external semantic backend. Previous semantic rules and evidence are retained for compatibility.</p>
+  <p class="content-policy__migration" role="status">Saving these preferences selects local NudeNet scanning instead of the previous semantic backend. Independent local contextual discovery, if enabled, still runs alongside NudeNet. Previous semantic rules and evidence are retained for compatibility.</p>
   {% endif %}
   <input type="hidden" name="scene_semantic_enabled" value="false">
   <input type="hidden" name="scene_semantic_window_seconds" value="{{ values.scene_semantic_window_seconds }}">

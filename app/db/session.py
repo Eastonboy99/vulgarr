@@ -200,6 +200,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scene_content_policy": DEFAULT_POLICY,
     "scene_semantic_enabled": False,
     "scene_semantic_window_seconds": 10.0,
+    # Independent discovery, never gated by NudeNet hits. Local endpoints only.
+    "scene_contextual_enabled": False,
+    "scene_contextual_base_url": "",
+    "scene_contextual_api_key": "",
+    "scene_contextual_model": "qwen3.5-4b",
+    "scene_contextual_window_seconds": 8.0,
+    "scene_contextual_timeout_seconds": 300.0,
     # Empty roots preserve legacy in-place audio and sibling blur behavior.
     "movie_output_folder": "",
     "tv_output_folder": "",

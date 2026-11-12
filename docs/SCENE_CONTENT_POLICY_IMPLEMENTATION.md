@@ -1,6 +1,6 @@
 # Scene reset, audio and content-policy implementation
 
-> **Historical initial-rollout report.** The follow-up [NudeNet content-preferences design](NUDENET_CONTENT_PREFERENCES.md) supersedes the menu/taxonomy, default scan UI and policy-schema descriptions below. The current menu exposes NudeNet's exact 18 body-part labels, not the initial semantic/disabled category list. Audio, atomic-scan and publication safeguards described here remain in place.
+> **Historical initial-rollout report.** The follow-up [NudeNet content-preferences design](NUDENET_CONTENT_PREFERENCES.md) supersedes the menu/taxonomy, default scan UI and policy-schema descriptions below. The current menu exposes NudeNet's exact 18 body-part labels, not the initial semantic/disabled category list. Independent [local contextual-nudity discovery](LOCAL_CONTEXTUAL_NUDITY.md) now supplements those detector labels and adds policy schema 3. Audio, atomic-scan and publication safeguards described here remain in place.
 
 ## Shipped behavior
 

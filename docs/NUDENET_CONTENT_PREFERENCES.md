@@ -4,6 +4,8 @@
 
 The content-preferences menu uses **only NudeNet 3.4.2's actual 18 detector labels**, not inferred garment/activity categories or nonfunctional disabled controls.
 
+Separate opt-in [local contextual-nudity discovery](LOCAL_CONTEXTUAL_NUDITY.md) now runs alongside this detector when enabled. It is not presented as an additional NudeNet label and does not change these 18 controls.
+
 Authoritative upstream label list: [NudeNet v3 source](https://github.com/notAI-tech/NudeNet/blob/v3/nudenet/nudenet.py). The exact IDs and readable/grouped names live in `app/vision/nudenet_labels.py`.
 
 | Menu group | Exact detector labels |
@@ -29,13 +31,13 @@ The layout provides grouped disclosure panels, aligned label/action rows, readab
 
 ## Compatibility and privacy
 
-Policy schema 2 adds namespaced `nudenet.*` IDs. Schema-1 policies upgrade on validation/read, preserving existing semantic rules and reviewed evidence for compatibility. Existing exposed-anatomy preferences map to the equivalent raw labels; clothing preferences are **not** guessed into covered-anatomy rules. No destructive DB or media migration is performed.
+Policy schema 3 retains schema 2's namespaced `nudenet.*` IDs and adds a separate `nudity.contextual` action. Schema-1/2 policies upgrade on validation/read, preserving existing semantic rules, NudeNet preferences and reviewed evidence for compatibility. Existing exposed-anatomy preferences map to the equivalent raw labels; clothing preferences are **not** guessed into covered-anatomy rules. No destructive DB or media migration is performed.
 
-The redesigned form selects **local NudeNet scanning** when saved. If the previous external semantic backend was enabled, a visible notice explains the switch; its old rules/evidence remain stored, but semantic controls are no longer offered in this menu. The server retains compatibility with earlier settings imports and existing evidence. Local scans do not need a vision provider or send frames to one. Existing explicitly configured remote NudeNet workers remain supported.
+The redesigned form selects **local NudeNet scanning** when saved. If the previous external semantic backend was enabled, a visible notice explains the switch; its old rules/evidence remain stored, but semantic controls are no longer offered in this menu. The server retains compatibility with earlier settings imports and existing evidence. NudeNet-only scans do not need a vision provider or send frames to one. Enabling independent contextual discovery additionally sends sampled frames to the explicitly configured local vision server. Existing explicitly configured remote NudeNet workers remain supported.
 
 Saving never regenerates a library. Review/re-scan the intended title as indicated, then explicitly regenerate. Previously published edits and source-preservation/clean-audio/mux safeguards remain unchanged.
 
-## Verification
+## Original NudeNet rollout verification (historical)
 
 - `python -m pytest tests/ -q`: **432 passed, 12 skipped**, 5 dependency warnings.
 - `SPF_TEST_RENDER_CONTAINERS=vulgarr-worker-worker-0-1,vulgarr-worker-worker-1-1 python -m pytest tests/ -q`: **456 passed**, 5 dependency warnings.

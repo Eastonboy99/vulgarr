@@ -1,3 +1,4 @@
+{% set is_contextual = scene.evidence_display and 'nudity.contextual' in scene.evidence_display.coverage %}
 <div class="scene-review-row" data-scene-categories="{{ scene.evidence_display.labels.keys() | join(' ') if scene.evidence_display and scene.evidence_display.labels else '__unclassified__' }}" style="display: flex; align-items: flex-start; gap: 0.75rem; flex-wrap: wrap; padding: 0.5rem 0; border-bottom: 1px solid var(--vulgarr-border);">
   <img
     id="scene-thumb-{{ scene.id }}"
@@ -14,7 +15,8 @@
         type="button" class="small secondary"
         onclick="toggleScenePreview(this, 'scene-preview-{{ scene.id }}', {{ title_id }}, {{ scene.start_seconds }}, {{ scene.end_seconds }})"
       >Preview</button>
-      {% if scene.source != 'manual' %}<span class="stat-pill" title="Peak per-frame classifier confidence"><i class="ti ti-gauge" aria-hidden="true"></i><span class="stat-pill-label">confidence</span> {{ (scene.peak_confidence * 100) | round | int }}%</span>{% endif %}
+      {% if is_contextual %}<span class="badge badge-scenes_pending_review">Local AI candidate · {{ 'review required' if scene.status.value == 'pending' else 'manually reviewed' }}</span>{% endif %}
+      {% if scene.source != 'manual' and not is_contextual %}<span class="stat-pill" title="Peak per-frame classifier confidence"><i class="ti ti-gauge" aria-hidden="true"></i><span class="stat-pill-label">confidence</span> {{ (scene.peak_confidence * 100) | round | int }}%</span>{% endif %}
       {% if scene.verified_fraction is not none %}
         <span class="stat-pill" title="Fraction of a denser re-scan of this window's padded range that cleared the confidence threshold"><i class="ti ti-shield-check" aria-hidden="true"></i><span class="stat-pill-label">verified</span> {{ (scene.verified_fraction * 100) | round | int }}%</span>
         {% if scene.verified_fraction >= high_confidence_fraction %}<span class="badge badge-done">high confidence</span>{% endif %}
@@ -23,12 +25,13 @@
 
     <p class="muted">Effective action: <strong>{{ {'allow': 'Allowed', 'blur': 'Blur only', 'blur_mute': 'Blur + mute'}[scene.effective_decision.action.value] }}</strong>
       · {{ 'audio inherited' if scene.audio_override is none else 'audio overridden' }}
-      {% if scene.effective_decision.needs_review %} · uncertain — review required{% endif %}
+      {% if scene.effective_decision.needs_review and (not is_contextual or scene.status.value == 'pending') %} · AI / uncertain evidence — review required{% endif %}
     </p>
     {% if scene.evidence_display %}
-      {% for category, confidence in scene.evidence_display.labels.items() %}<span class="badge">{{ category_labels[category][0] }} {{ (confidence * 100)|round|int }}%</span>{% endfor %}
+      {% for category, confidence in scene.evidence_display.labels.items() %}<span class="badge">{{ category_labels[category][0] }} {% if is_contextual %}AI flag{% else %}{{ (confidence * 100)|round|int }}%{% endif %}</span>{% endfor %}
       <p class="muted">{{ scene.evidence_display.explanation }} · {{ scene.evidence_display.model }} · schema {{ scene.evidence_display.schema_version }}</p>
     {% else %}<p class="muted">Legacy / unclassified or manual window</p>{% endif %}
+    {% if is_contextual and not scene.evidence_display.labels %}<p class="muted">Uncertain bare skin is not proven nudity. Review the preview and choose a manual Blur override if you want this interval filtered.</p>{% endif %}
     <form class="inline" hx-post="/scenes/{{ scene.id }}/action" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
       <input type="hidden" name="title_id" value="{{ title_id }}">
       {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
@@ -41,13 +44,13 @@
     <div class="scene-preview" id="scene-preview-{{ scene.id }}" style="display: none;"></div>
 
     {% if scene.claude_verify_reason %}
-      <div class="muted scene-review-claude" title="Verdict from the optional Claude Vision precision filter, see Settings">
+      <div class="muted scene-review-claude" title="Verdict from the optional Candidate verification precision filter, see Settings">
         {% if scene.claude_verify_reason.startswith('YES:') %}<span class="badge badge-done">VLM confirmed</span>{% endif %}
         {% if scene.claude_verify_reason.startswith('NO:') %}<span class="badge badge-rejected">VLM rejected</span>{% endif %}
         {% if scene.mute_audio %}<span class="badge badge-queued">audio muted on apply</span>{% endif %}
-        Claude Vision: {{ scene.claude_verify_reason }}
+        Candidate verification: {{ scene.claude_verify_reason }}
       </div>
-    {% elif claude_vision_verify_enabled %}
+    {% elif claude_vision_verify_enabled and not is_contextual %}
       <div class="muted scene-review-claude">Not verified</div>
     {% endif %}
 

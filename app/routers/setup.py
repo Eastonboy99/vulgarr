@@ -7,7 +7,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from app.db.session import get_session, set_setting
+from app.db.session import get_session, get_setting, set_setting
+from app.vision import contextual
 from app.routers.settings import SETTING_KEYS, _load_all
 from app.scenes.content_policy import validate_policy
 
@@ -63,6 +64,10 @@ async def import_config(request: Request):
             window = filtered["scene_semantic_window_seconds"]
             if type(window) not in (int, float) or not 1 <= window <= 30:
                 raise ValueError("Semantic window must be between 1 and 30 seconds")
+        if set(filtered) & set(contextual.KEYS):
+            async with get_session() as session:
+                config = {key: filtered.get(key, await get_setting(session, key)) for key in contextual.KEYS}
+            await contextual.validate_config(config)
     except (ValueError, TypeError):
         return JSONResponse({"ok": False, "error": "Invalid or unsupported content policy settings"}, status_code=400)
     async with get_session() as session:

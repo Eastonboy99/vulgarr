@@ -8,6 +8,7 @@ from fastapi.templating import Jinja2Templates
 from app.db.session import get_session, get_setting, hash_password, set_setting
 from app.domain import PRECISE_MODES
 from app.scenes.content_policy import CATEGORIES, VISUAL_CATEGORIES, validate_policy
+from app.vision import contextual
 from app.vision.nudenet_labels import NUDENET_LABELS, NUDENET_LABEL_DETAILS, NUDENET_GROUPS, category_id
 from app.mux.scene_blur import BLUR_LEVEL_PRESETS, blur_level_to_radius_power, radius_power_to_blur_level
 
@@ -15,6 +16,7 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 templates = Jinja2Templates(directory="app/templates")
 
 SETTING_KEYS = [
+    *contextual.KEYS,
     "scene_content_policy", "scene_semantic_enabled", "scene_semantic_window_seconds",
     "concurrency_cap",
     "off_hours_enabled",
@@ -175,6 +177,13 @@ async def update_settings(
     scene_content_policy: str = Form(""),
     scene_semantic_enabled: bool = Form(False),
     scene_semantic_window_seconds: float = Form(10.0),
+    scene_contextual_present: bool = Form(False),
+    scene_contextual_enabled: bool = Form(False),
+    scene_contextual_base_url: str = Form(""),
+    scene_contextual_api_key: str = Form(""),
+    scene_contextual_model: str = Form("qwen3.5-4b"),
+    scene_contextual_window_seconds: float = Form(8.0),
+    scene_contextual_timeout_seconds: float = Form(300.0),
 ):
     # Validate before writing any settings. Old clients omit policy and retain
     # the current value rather than silently resetting it to defaults.
@@ -188,6 +197,15 @@ async def update_settings(
         raise HTTPException(422, "Semantic window must be between 1 and 30 seconds")
     if scene_semantic_enabled and (not claude_vision_base_url.strip() or not claude_vision_model.strip()):
         raise HTTPException(422, "Semantic analysis requires an explicitly configured vision endpoint/model")
+    if scene_contextual_present:
+        try:
+            contextual.validate_sampling(scene_contextual_window_seconds, scene_contextual_timeout_seconds)
+            if scene_contextual_enabled:
+                if not scene_contextual_model.strip() or len(scene_contextual_model.strip()) > 1000:
+                    raise ValueError("A local vision model identifier is required")
+                await contextual.local_endpoint(scene_contextual_base_url)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     movie_output_folder = movie_output_folder.strip()
     tv_output_folder = tv_output_folder.strip()
     if any(folder and not Path(folder).is_absolute() for folder in (movie_output_folder, tv_output_folder)):
@@ -283,6 +301,17 @@ async def update_settings(
         await set_setting(session, "scene_auto_process", scene_auto_process)
         if policy is not None:
             await set_setting(session, "scene_content_policy", policy)
+        if scene_contextual_present:
+            context_values = {
+                "scene_contextual_enabled": scene_contextual_enabled,
+                "scene_contextual_base_url": scene_contextual_base_url.strip(),
+                "scene_contextual_api_key": scene_contextual_api_key.strip(),
+                "scene_contextual_model": scene_contextual_model.strip(),
+                "scene_contextual_window_seconds": scene_contextual_window_seconds,
+                "scene_contextual_timeout_seconds": scene_contextual_timeout_seconds,
+            }
+            for key, value in context_values.items():
+                await set_setting(session, key, value)
         await set_setting(session, "scene_semantic_enabled", scene_semantic_enabled)
         await set_setting(session, "scene_semantic_window_seconds", scene_semantic_window_seconds)
         claude_vision_base_url = claude_vision_base_url.strip()
@@ -293,7 +322,7 @@ async def update_settings(
         # inconsistent "on but unconfigured" state. claude_vision_blocked
         # (below) is what tells the template *why*, for the one save where
         # this actually mattered.
-        claude_vision_ready = bool(claude_vision_base_url and claude_vision_api_key)
+        claude_vision_ready = bool(claude_vision_base_url and claude_vision_model.strip())
         claude_vision_blocked = claude_vision_verify_enabled and not claude_vision_ready
         await set_setting(session, "claude_vision_verify_enabled", claude_vision_verify_enabled and claude_vision_ready)
         await set_setting(session, "claude_vision_base_url", claude_vision_base_url)

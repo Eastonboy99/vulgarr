@@ -25,9 +25,10 @@ from app.db.session import get_setting
 from app.domain import SceneReviewStatus
 from app.mux.remux import ProgressCallback, StageCallback, probe
 from app.mux.scene_blur import apply_blur
-from app.scenes.content_policy import Action, VISUAL_CATEGORIES, NUDENET_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint, validate_policy, nudenet_evidence
+from app.scenes.content_policy import Action, VISUAL_CATEGORIES, NUDENET_CATEGORIES, CONTEXTUAL_CATEGORIES, RENDER_SETTING_KEYS, scene_decision, policy_fingerprint, scene_set_fingerprint, validate_policy, nudenet_evidence
 from app.vision.nudenet_labels import NUDENET_LABELS, category_id
 from app.vision.content_classifier import scan_content_windows, classify_window
+from app.vision import contextual
 from app.vision.claude_verify import verify_candidate
 from app.vision.classifier import scan_video_frames, scan_window_frames, detection_labels
 from app.vision.scene_cluster import (
@@ -197,6 +198,10 @@ async def _scan_for_scenes(
     robust per-scene signal than the main scan's single peak_confidence value.
     Powers the review list's one-click "Approve high-confidence" bulk action.
     """
+    contextual_config = await _contextual_config(session)
+    if contextual_config["scene_contextual_enabled"]:
+        contextual.validate_sampling(contextual_config["scene_contextual_window_seconds"], contextual_config["scene_contextual_timeout_seconds"])
+        await contextual.local_endpoint(contextual_config["scene_contextual_base_url"])
     auto_process = bool(await get_setting(session, "scene_auto_process"))
     confidence_threshold = float(await get_setting(session, "scene_confidence_threshold"))
     frame_interval = float(await get_setting(session, "scene_frame_interval_seconds"))
@@ -226,14 +231,14 @@ async def _scan_for_scenes(
 
     if bool(await get_setting(session, "scene_semantic_enabled")):
         return await _scan_semantic(session, title, job_id, scan_work_dir,
-                                    fingerprint, duration, on_progress, on_stage)
+                                    fingerprint, duration, on_progress, on_stage, contextual_config)
 
     scores = await scan_video_frames(
         video_path,
         app_settings.ffmpeg_bin,
         duration_seconds=duration,
         frame_interval_seconds=frame_interval,
-        on_progress=on_progress,
+        on_progress=_progress_slice(on_progress, 0, .35) if contextual_config["scene_contextual_enabled"] else on_progress,
         concurrency=frame_concurrency,
         resume_scores_path=resume_scores_path,
         on_status=on_stage,
@@ -321,11 +326,15 @@ async def _scan_for_scenes(
     current_policy = validate_policy(await get_setting(session, "scene_content_policy"))
     if selected != sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow"):
         raise ValueError("Detection label preferences changed during scanning; run a fresh scan")
+    contextual_analysis = await _add_contextual_rows(session, title, job_id, staged_rows, scan_work_dir,
+        fingerprint, duration, contextual_config, on_progress, on_stage)
+    need_review_count += contextual_analysis.pop("added_rows")
     await _activate_scan(session, title.id, job_id, staged_rows, analysis={
         "schema_version": 1, "backend": "nudenet", "model": "NudeNet 3.4.2",
+        **contextual_analysis,
         # Only enabled labels proposed windows across the full title. Enabling
         # another label later requires a fresh scan, not invented coverage.
-        "coverage": selected, "detector_categories": sorted(NUDENET_CATEGORIES),
+        "coverage": sorted(set(selected) | (CONTEXTUAL_CATEGORIES if contextual_config["scene_contextual_enabled"] else set())), "detector_categories": sorted(NUDENET_CATEGORIES),
         "frame_interval_seconds": frame_interval,
     })
 
@@ -334,8 +343,88 @@ async def _scan_for_scenes(
     # fresh scan_work_dir regardless, so there's nothing to gain by keeping it.
     shutil.rmtree(scan_work_dir, ignore_errors=True)
 
-    return ScanOutcome(candidate_count=len(candidates), auto_approved_count=auto_approved_count,
+    return ScanOutcome(candidate_count=len(staged_rows), auto_approved_count=auto_approved_count,
                        need_review_count=need_review_count)
+
+
+def _progress_slice(callback, start, end):
+    if callback is None:
+        return None
+    async def progress(done, total):
+        fraction = min(1, max(0, done / total)) if total > 0 else 0
+        await callback(round((start + (end - start) * fraction) * 10000), 10000)
+    return progress
+
+
+async def _contextual_config(session):
+    return {key: await get_setting(session, key) for key in contextual.KEYS}
+
+
+async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerprint,
+                               duration, config, on_progress, on_stage):
+    """Stage independent proposals without publishing or vetoing NudeNet rows.
+
+    Adjacent equivalent windows coalesce. Subtract already-blocking detector
+    intervals so overlapping analyzers do not create duplicate review scenes.
+    No NudeNet refinement is applied: it cannot validate obscured nudity.
+    """
+    analysis = {"contextual_fingerprint": contextual.config_fingerprint(config),
+                "contextual_enabled": bool(config["scene_contextual_enabled"]), "added_rows": 0}
+    if not config["scene_contextual_enabled"]:
+        return analysis
+    if on_stage:
+        await on_stage("Independent local contextual-nudity discovery across the whole title (review required)")
+    windows = await contextual.scan_contextual_windows(video_path=Path(title.video_path), duration=duration,
+        checkpoint_dir=work_dir, fingerprint=fingerprint,
+        base_url=config["scene_contextual_base_url"], api_key=config["scene_contextual_api_key"],
+        model=config["scene_contextual_model"], ffmpeg_bin=app_settings.ffmpeg_bin,
+        window_seconds=config["scene_contextual_window_seconds"],
+        timeout_seconds=config["scene_contextual_timeout_seconds"], on_progress=_progress_slice(on_progress, .35, .99))
+    policy = await get_setting(session, "scene_content_policy")
+    blockers = merge_intervals([(r.start_seconds, r.end_seconds) for r in rows
+        if scene_decision(r, policy).action != Action.allow], merge_gap_seconds=0)
+    groups = []
+    for start, end, evidence in windows:
+        if not evidence["labels"] and not evidence["uncertain"]:
+            continue
+        if (groups and abs(groups[-1][1] - start) < 1e-6
+                and groups[-1][2]["labels"] == evidence["labels"]
+                and groups[-1][2]["uncertain"] == evidence["uncertain"]):
+            groups[-1][1] = end
+            groups[-1][3] += 1
+        else:
+            groups.append([start, end, dict(evidence), 1])
+    added = 0
+    for start, end, evidence, count in groups:
+        segments = [(start, end)]
+        for left, right in blockers:
+            remainder = []
+            for a, b in segments:
+                if right <= a or left >= b:
+                    remainder.append((a, b))
+                else:
+                    if a < left:
+                        remainder.append((a, left))
+                    if right < b:
+                        remainder.append((right, b))
+            segments = remainder
+        evidence["explanation"] = (f"Local AI candidate across {count} sampled window(s); human review required. " + evidence["explanation"])[:1000]
+        for a, b in segments:
+            if b - a < 1e-6:
+                continue
+            rows.append(DetectedScene(id=secrets.randbits(62) + 1, title_id=title.id,
+                scan_generation=job_id, start_seconds=a, end_seconds=b,
+                peak_confidence=1.0 if evidence["labels"] else 0.0,
+                verified_fraction=None, category_evidence=json.dumps(evidence),
+                detector_evidence=json.dumps({"backend": "local-contextual", "version": contextual.VERSION,
+                    "window_seconds": config["scene_contextual_window_seconds"],
+                    "fractions": contextual.FRACTIONS, "window_count": count}),
+                mute_audio=False, status=SceneReviewStatus.pending, source="detected"))
+            added += 1
+    analysis.update(added_rows=added, contextual={"model": config["scene_contextual_model"],
+        "windows": len(windows), "window_seconds": config["scene_contextual_window_seconds"],
+        "samples_per_window": len(contextual.FRACTIONS), "review_required": True})
+    return analysis
 
 
 async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
@@ -355,12 +444,16 @@ async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
     if not fence.rowcount:
         await session.rollback()
         raise ValueError("Scene scan was cancelled, completed or superseded; previous results retained")
+    if analysis and "contextual_fingerprint" in analysis:
+        if contextual.config_fingerprint(await _contextual_config(session)) != analysis["contextual_fingerprint"]:
+            await session.rollback()
+            raise ValueError("Contextual discovery settings changed during scanning; previous scenes retained")
     if analysis and analysis.get("backend") == "nudenet":
         # The activation write reservation also fences settings changes, so
         # newly enabled proposal classes cannot be missed by a late scan.
         current_policy = validate_policy(await get_setting(session, "scene_content_policy"))
         enabled = sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow")
-        if enabled != analysis["coverage"]:
+        if enabled != sorted(set(analysis["coverage"]) & NUDENET_CATEGORIES):
             await session.rollback()
             raise ValueError("Detection label preferences changed during scanning; previous scenes retained")
     conditions = [DetectedScene.title_id == title_id]
@@ -381,15 +474,16 @@ async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
 
 
 async def _scan_semantic(session, title, job_id, work_dir, fingerprint, duration,
-                         on_progress, on_stage) -> ScanOutcome:
+                         on_progress, on_stage, contextual_config=None) -> ScanOutcome:
     """Broad opt-in proposals, independent of scalar exposure detections.
 
     Retain all observed labels, including currently allowed categories, so a
     later policy change can reuse evidence rather than repeat paid model calls.
     Failed windows abort the swap and preserve the last successful scene set.
     """
+    contextual_config = contextual_config or await _contextual_config(session)
     if on_stage is not None:
-        await on_stage("Sampling clothing/nudity across the whole title (external vision API)")
+        await on_stage("Sampling clothing/nudity across the whole title (configured vision endpoint)")
     windows = await scan_content_windows(
         video_path=Path(title.video_path), duration=duration,
         window_seconds=float(await get_setting(session, "scene_semantic_window_seconds")),
@@ -397,7 +491,8 @@ async def _scan_semantic(session, title, job_id, work_dir, fingerprint, duration
         base_url=await get_setting(session, "claude_vision_base_url"),
         api_key=await get_setting(session, "claude_vision_api_key"),
         model=await get_setting(session, "claude_vision_model"),
-        ffmpeg_bin=app_settings.ffmpeg_bin, on_progress=on_progress,
+        ffmpeg_bin=app_settings.ffmpeg_bin,
+        on_progress=_progress_slice(on_progress, 0, .35) if contextual_config["scene_contextual_enabled"] else on_progress,
     )
     auto_process = bool(await get_setting(session, "scene_auto_process"))
     policy = await get_setting(session, "scene_content_policy")
@@ -422,9 +517,12 @@ async def _scan_semantic(session, title, job_id, work_dir, fingerprint, duration
         else:
             pending += 1
         rows.append(scene)
+    contextual_analysis = await _add_contextual_rows(session, title, job_id, rows, work_dir,
+        fingerprint, duration, contextual_config, on_progress, on_stage)
+    pending += contextual_analysis.pop("added_rows")
     await _activate_scan(session, title.id, job_id, rows, analysis={
-        "schema_version": 1, "backend": "semantic-sampled-frames",
-        "coverage": sorted(VISUAL_CATEGORIES), "windows": len(windows),
+        "schema_version": 1, "backend": "semantic-sampled-frames", **contextual_analysis,
+        "coverage": sorted(VISUAL_CATEGORIES | (CONTEXTUAL_CATEGORIES if contextual_config["scene_contextual_enabled"] else set())), "windows": len(windows),
         "window_seconds": float(await get_setting(session, "scene_semantic_window_seconds")),
         "model": await get_setting(session, "claude_vision_model"),
         "scanned_at": datetime.datetime.utcnow().isoformat(),
@@ -652,29 +750,17 @@ async def reverify_scenes_with_claude(
     title: Title,
     on_progress: ScanProgressCallback | None = None,
 ) -> ReverifyOutcome:
-    """Re-runs the optional Claude Vision precision filter (app.vision.claude_verify)
-    against every currently pending/approved DetectedScene on this title, using
-    each scene's already-stored (and possibly hand-adjusted) start/end. The manual
-    counterpart to the same check scan_for_scenes runs automatically during a fresh
-    scan -- exists for the case that check's own settings docs warn about: scenes
-    scanned (and, with scene_auto_process on, auto-approved) *before*
-    claude_vision_verify_enabled was ever turned on never got this filter applied at
-    all, and there's no "undo" for an auto-approval already made short of a human
-    eyeballing every scene by hand.
+    """Recheck existing non-rejected legacy windows at the configured endpoint.
 
-    Only scenes not already rejected are touched -- a rejected candidate already has
-    a verdict (human or Claude) and there's no upside to re-spending money confirming
-    it again. Every remaining candidate is re-scored regardless of verified_fraction
-    -- unlike a fresh scan, there's no claude_skip_above_fraction shortcut here, since
-    that exists purely to skip *paying* for scenes NudeNet's own dense re-scan
-    already trusted, which has no bearing on whether this manual recheck should run.
+    This is not whole-title discovery. Exact NudeNet and local contextual
+    evidence are skipped: a generic yes/no prompt must not veto those distinct
+    observations. Legacy structured evidence uses its own semantic opt-in.
+    The historical function/setting names remain for compatibility, but the
+    endpoint can be local (LM Studio) or external; the UI explains the difference.
 
-    A definite YES/NO verdict sets status accordingly (approved/rejected), the same
-    semantics scan_for_scenes already uses -- an explicit Claude "no" is a considered
-    verdict, not an unknown. A failed/unreachable call leaves the scene's existing
-    status untouched (never downgrades an already-approved scene just because the
-    endpoint hiccuped) but still records the failure in claude_verify_reason so it's
-    visible which scenes still need an actual look.
+    A definite legacy YES/NO may approve/reject an eligible legacy candidate.
+    A failed call retains its previous status and records only a safe failure
+    marker. Existing published media is never modified by this operation.
     """
     semantic_enabled = bool(await get_setting(session, "scene_semantic_enabled"))
     legacy_enabled = bool(await get_setting(session, "claude_vision_verify_enabled"))
@@ -697,7 +783,7 @@ async def reverify_scenes_with_claude(
     failed_count = 0
     now = datetime.datetime.utcnow()
     for i, scene in enumerate(scenes):
-        if scene.category_evidence and set(json.loads(scene.category_evidence)["coverage"]) == NUDENET_CATEGORIES:
+        if scene.category_evidence and set(json.loads(scene.category_evidence)["coverage"]) in (NUDENET_CATEGORIES, CONTEXTUAL_CATEGORIES):
             # A legacy semantic verifier cannot reinterpret exact body-part
             # choices. Fresh local scans update these detector observations.
             approved_count += int(scene.status == SceneReviewStatus.approved)

@@ -378,7 +378,7 @@ class SceneJobQueue:
                 job.progress_message = "Scanning for scenes"
                 title.scene_scan_status = "scanning"
             elif is_claude_verify:
-                job.progress_message = "Verifying scenes with Claude Vision"
+                job.progress_message = "Verifying existing legacy scene candidates"
             else:
                 job.progress_message = "Blurring video"
             await session.commit()
@@ -470,7 +470,7 @@ class SceneJobQueue:
                     return
                 last_update_monotonic = now
                 job.progress_percent = round(100 * done / total, 1)
-                job.progress_message = f"Verifying with Claude Vision -- scene {done}/{total}"
+                job.progress_message = f"Verifying existing candidates -- scene {done}/{total}"
                 await session.commit()
 
             try:
@@ -497,7 +497,9 @@ class SceneJobQueue:
                     # approved. A concurrent manual scan-scenes/apply-scenes click
                     # can't double-enqueue here -- enqueue_blur_if_not_already_active
                     # checks for an existing queued/processing blur job first.
-                    if (scan_outcome.candidate_count or title.vulgarr_edit_path) and bool(await get_setting(session, "scene_auto_process")):
+                    if (scan_outcome.need_review_count == 0
+                            and (scan_outcome.candidate_count or title.vulgarr_edit_path)
+                            and bool(await get_setting(session, "scene_auto_process"))):
                         await session.commit()
                         await self.enqueue_blur_if_not_already_active(title.id)
                 elif is_claude_verify:

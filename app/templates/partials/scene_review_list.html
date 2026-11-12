@@ -53,6 +53,7 @@
   {% if policy_stale %}<p class="muted">Policy changed — review effective actions, then regenerate this title. Existing media has not changed.</p>{% endif %}
   {% if legacy_evidence or needs_reanalysis %}<p class="muted">Missing detector-label coverage: run a fresh scan to apply current detection preferences. Policy changes cannot infer labels absent from old analysis.</p>{% endif %}
   {% if scene_analysis %}<p class="muted">Analysis: {{ scene_analysis.backend }}{% if scene_analysis.model %} · {{ scene_analysis.model }}{% endif %}{% if scene_analysis.backend == 'nudenet' %} · {{ scene_analysis.frame_interval_seconds }}-second sampling interval.{% elif scene_analysis.windows %} · {{ scene_analysis.windows }} sampled windows ({{ scene_analysis.window_seconds }} seconds each).{% endif %} Unsampled shots may be missed.</p>{% endif %}
+  {% if scene_analysis and scene_analysis.contextual %}<p class="muted">Independent local contextual discovery: {{ scene_analysis.contextual.model }} · {{ scene_analysis.contextual.windows }} windows · four samples per {{ scene_analysis.contextual.window_seconds }} seconds. New AI candidates require review. Boundaries are sampled windows, not frame-exact; unsampled shots may be missed.</p>{% endif %}
   {% for category, count in category_counts.items() %}<span class="badge">{{ category_labels[category][0] }}: {{ count }}</span>{% endfor %}
   {% if scenes %}
     <form hx-vals='{"scan_generation": "{{ scan_generation }}"}' hx-post="/library/title/{{ title_id }}/reset-scene-audio" hx-target="{{ scene_review_target }}" hx-swap="outerHTML" hx-confirm="Clear all per-scene audio choices, including preserved legacy choices, and use global audio defaults? Media changes only after Apply.">
@@ -82,16 +83,16 @@
     <form hx-post="/library/title/{{ title_id }}/reverify-scenes-claude" hx-target="{{ scene_review_target }}" hx-swap="outerHTML">
       {% if detail_view %}<input type="hidden" name="detail_view" value="true">{% endif %}
       <button type="submit" class="small secondary" {% if claude_verify_active or not claude_reverifiable_count %}disabled{% endif %}
-        title="Re-checks every non-rejected candidate against the Claude Vision precision filter, e.g. for scenes auto-approved before that setting was turned on.">
+        title="Re-checks every non-rejected candidate against the candidate verification precision filter, e.g. for scenes auto-approved before that setting was turned on.">
         {% if claude_verify_active %}
-          <span class="spinner"></span> Verifying with Claude Vision…
+          <span class="spinner"></span> Verifying with candidate verification…
         {% else %}
-          Reprocess {{ claude_reverifiable_count }} scene(s) with Claude Vision
+          Verify {{ claude_reverifiable_count }} existing legacy scene(s)
         {% endif %}
       </button>
     </form>
     {% if claude_verify_active and not detail_view %}
-    <form hx-post="/scene-jobs/{{ claude_verify_job.id }}/cancel" hx-target="#scene-review-{{ title_id }}" hx-swap="outerHTML" hx-confirm="Cancel Claude Vision verification?">
+    <form hx-post="/scene-jobs/{{ claude_verify_job.id }}/cancel" hx-target="#scene-review-{{ title_id }}" hx-swap="outerHTML" hx-confirm="Cancel candidate verification verification?">
       <input type="hidden" name="title_id" value="{{ title_id }}">
       <button type="submit" class="small danger">Cancel</button>
     </form>
@@ -105,7 +106,7 @@
     </div>
     {% endif %}
   {% elif claude_verify_job and claude_verify_job.state.value == 'failed' %}
-    <div class="muted" style="color: var(--vulgarr-danger-text); margin-top: 0.4rem;">Last Claude Vision reprocess failed{% if claude_verify_job.error %}: {{ claude_verify_job.error }}{% else %} -- try again{% endif %}.</div>
+    <div class="muted" style="color: var(--vulgarr-danger-text); margin-top: 0.4rem;">Last candidate verification reprocess failed{% if claude_verify_job.error %}: {{ claude_verify_job.error }}{% else %} -- try again{% endif %}.</div>
   {% elif claude_verify_job and claude_verify_job.state.value == 'done' %}
     <div class="muted" style="margin-top: 0.4rem;">{{ claude_verify_job.progress_message }}</div>
   {% endif %}

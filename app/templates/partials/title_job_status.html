@@ -1,6 +1,6 @@
 {# The "what's actively happening to this title right now" bar -- shown once,
    directly under the status pill, instead of scattered across the Video column
-   (Apply) and the Scene Review section (scan / Claude Vision) where you had to
+   (Apply) and the Scene Review section (scan / candidate verification) where you had to
    scroll to find it. Only rendered from title_detail_card.html (detail_view);
    scene_review_list.html/scene_review_apply_row.html render the equivalent
    progress+message inline for the standalone scene-review page, where there's
@@ -46,8 +46,8 @@
 {% if claude_verify_active %}
 <div class="job-status">
   <div class="job-progress">{% if claude_verify_job.progress_percent is not none %}<div class="job-progress-fill" style="width: {{ claude_verify_job.progress_percent }}%"></div>{% endif %}</div>
-  <span class="job-status-msg">{{ claude_verify_job.progress_message or 'Verifying with Claude Vision…' }}</span>
-  <form hx-post="/scene-jobs/{{ claude_verify_job.id }}/cancel" hx-target="#title-detail-{{ title_id }}" hx-swap="outerHTML" hx-confirm="Cancel Claude Vision verification?">
+  <span class="job-status-msg">{{ claude_verify_job.progress_message or 'Verifying with candidate verification…' }}</span>
+  <form hx-post="/scene-jobs/{{ claude_verify_job.id }}/cancel" hx-target="#title-detail-{{ title_id }}" hx-swap="outerHTML" hx-confirm="Cancel candidate verification verification?">
     <input type="hidden" name="title_id" value="{{ title_id }}">
     <input type="hidden" name="detail_view" value="true">
     <button type="submit" class="small danger">Cancel</button>

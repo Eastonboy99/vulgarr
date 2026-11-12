@@ -27,9 +27,10 @@ Vulgarr runs two independent pipelines against your library:
   classifier, queues them for a quick manual approve/reject in the UI (or
   auto-approves, if you turn that on), then produces a separate **"Vulgarr
   Edit"** copy of the file with those scenes blurred and optionally muted —
-  the original file is never modified. An optional Claude Vision pass can
-  double-check candidates before auto-approving, to catch false positives a
-  frame classifier alone tends to flag (e.g. ordinary swimwear).
+  the original file is never modified. Optional independent **local contextual
+  nudity discovery** can find unclothed people even when intimate anatomy is
+  obscured. It samples the whole video through a local vision model (such as
+  LM Studio), not just NudeNet hits, and always requires human review.
 
 Both pipelines are entirely opt-in per title/season/show and run
 independently of each other. Built to sit alongside an existing
@@ -73,16 +74,18 @@ cost and Apply produces a full second encoded copy of the file):
    candidate scenes, then does a second, denser re-scan of just each
    candidate's padded window to refine its actual start/end and compute a
    confidence stat used for one-click bulk-approval later.
-3. **Review**: candidates land in a per-title review queue — approve, reject,
-   or adjust each one's boundaries by hand. Optionally, turn on **auto-approve**
-   to skip this and have high-confidence scans approve themselves, and/or the
-   **Claude Vision precision filter** (`app/vision/claude_verify.py`) to send
-   a few frames per candidate to any OpenAI-compatible vision endpoint (e.g. a
-   self-hosted [LiteLLM](https://github.com/BerriAI/litellm) proxy in front of
-   Anthropic's API) for a second opinion before auto-approving — this is the
-   one thing in Vulgarr that costs real external money per use (a fraction of
-   a cent per scan), and it's off by default.
-4. **Apply** (`app/mux/scene_blur.py`, `app/scenes/pipeline.py`): re-encodes
+3. **Contextual discovery** (`app/vision/contextual.py`, optional): independently
+   samples four ordered frames per window across the whole title through a
+   private/local vision endpoint. Obscured-nudity and uncertain candidates are
+   combined with detector results without duplicate overlaps. No public
+   endpoint, redirect, environment proxy or remote fallback is allowed.
+4. **Review**: approve, reject or adjust candidates by hand. Optional auto-approval
+   applies to eligible NudeNet results, never contextual AI candidates. Pending
+   review blocks automatic publication. The separate candidate-verification
+   setting only rechecks existing legacy candidates; it cannot find missed
+   scenes or veto exact NudeNet/contextual evidence. Its configured endpoint
+   determines privacy/cost: LM Studio is local; a cloud provider is not.
+5. **Apply** (`app/mux/scene_blur.py`, `app/scenes/pipeline.py`): re-encodes
    just the approved windows with a boxblur (adjustable intensity, with a live
    preview in Settings) and optionally mutes their audio too, producing a
    sibling **"Vulgarr Edit"** file — the original is never touched. Re-running
@@ -237,7 +240,7 @@ real-media validation checklist before production use.
 - Poster-grid library views for movies and TV shows, synced from Sonarr/Radarr, with live search and sort
 - Per-title, per-season, and per-show severity levels (Child / Teen), with whole-line or precise (word-position estimate, or Whisper forced-alignment) mute modes
 - Configurable, versioned word list with severity tagging and whole-word matching
-- Local, self-hosted nudity/sex-scene detection with a manual review UI, optional auto-approve, and an optional Claude Vision precision filter
+- Local, self-hosted scene detection with NudeNet labels, optional independent contextual-nudity discovery, manual review, and optional detector auto-approval
 - Automatic triggers from Sonarr/Radarr import webhooks, Bazarr's subtitle-downloaded event, and/or per-title Radarr/Sonarr tags (`vulgarr-audio`/`vulgarr-video`/`vulgarr-both`, e.g. via Overseerr's Advanced Request tag picker)
 - Consolidated activity queue (In Progress / Completed) spanning both pipelines, with live progress, concurrency limits, and an off-hours processing window
 - Backup retention policy for original files under `/data/backups`
@@ -322,7 +325,7 @@ toggle hiding the finer classifier/encode-tuning knobs by default:
 
 - **Integrations** — Sonarr/Radarr/Bazarr URLs+API keys, the webhook token, default subtitle language, and the clean track's title/language tag. Editable here at any time; `.env` only supplies the first-run defaults.
 - **Audio Processing** — max concurrent ffmpeg jobs, off-hours processing window, automation triggers (independently enable/disable Sonarr/Radarr import and Bazarr's subtitle-downloaded event, and which one takes priority for de-duplication), and the default mute precision for newly-synced titles.
-- **Video Processing** — auto-approve/auto-process toggle, the optional Claude Vision precision filter (base URL/API key/model, off by default), classifier tuning (confidence threshold, frame sample interval, scene duration/merge-gap, concurrency), blur quality/speed/intensity with a live preview, and blur/mute padding around each approved scene.
+- **Video Processing** — local-only contextual discovery (endpoint, optional key, model, sampling and timeout; off by default), separate legacy candidate verification, detector auto-approval, classifier tuning, blur quality/speed/intensity with a live preview, and blur/mute padding. See [local contextual discovery](docs/LOCAL_CONTEXTUAL_NUDITY.md) for setup and limitations.
 - **Backups** — retention (in days) for files under `/data/backups`; defaults to 7, 0 keeps every backup forever.
 - **Authentication** — optional HTTP Basic Auth in front of the entire UI (**off by default**). Turn this on if the app is reachable by anyone besides you — e.g. exposed outside your LAN — since nothing here is protected otherwise, including the Sonarr/Radarr/Bazarr API keys visible on this same Settings page. Sonarr/Radarr/Bazarr's webhook calls are always exempt (they carry their own `?token=`, not a login). Note: Basic Auth alone doesn't protect against CSRF (browsers resend cached credentials on cross-site requests) — fine for a trusted LAN, but if you're exposing this beyond that, put it behind a reverse proxy/VPN rather than relying on Basic Auth as your only barrier.
 
@@ -331,7 +334,7 @@ toggle hiding the finer classifier/encode-tuning knobs by default:
 - Backups accumulate under `/data/backups` for 7 days by default (Settings > Backups); set it to 0 to keep every backup forever instead.
 - `backup_root` (`/data/backups`) should ideally be on the same filesystem as your media mount; otherwise the "move original aside" step becomes a slower copy+delete instead of an instant rename.
 - Subtitle matching mutes the whole subtitle cue's time range (padded slightly) by default — a plain `.srt` has no word-level timestamps of its own. Settings > Audio Processing has two opt-in, narrower alternatives: `estimate` (a proportional guess based on the word's position in the cue's text) and `whisper` (real word-level forced alignment against the actual audio, not a guess).
-- Scene detection is a classifier, not a certainty — it's tuned to prefer false positives over missed scenes, since every candidate goes through human review (or Claude Vision, if enabled) before anything is blurred, unless you turn auto-approve on.
+- Scene detection is not a certainty: sampling can miss short shots, and vision models can misread clothing or bare skin. Contextual candidates always require review; only eligible detector results can auto-approve. Whole-title contextual discovery can be slow on CPU. Neither a contextual flag nor a model's self-reported confidence is a guarantee of accuracy.
 - There's no per-user accounts/roles — Settings > Authentication is a single shared username/password (or nothing) in front of the whole app, not a multi-user system.
 
 ## License
