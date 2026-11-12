@@ -106,7 +106,13 @@ original Host/TLS server name. Redirects and environment proxies are disabled.
 A private endpoint could itself proxy to a cloud service: use a trusted local
 inference server, not a forwarding proxy, when local-only processing is required.
 
-Calls are sequential and timeout-bounded. Temporary sample images are deleted.
+Calls are sequential and timeout-bounded. Each frame explanation and the summary
+are schema-bounded to 240 characters, with a 2,048-token output budget. The prompt
+requests short observations rather than reasoning or category-definition debates.
+These limits are checked again client-side. Truncated output is rejected, never
+repaired into a guessed classification. Safe failures identify the window and
+separate token truncation, HTTP rejection, timeout, connection and validation errors.
+Temporary sample images are deleted.
 Job-scoped checkpoints contain only normalized evidence and a hashed identity,
 not credentials, endpoint URLs or raw images. Resume accepts only a contiguous
 compatible prefix; corrupt tails and source/model-identifier/config/prompt/schema
@@ -130,8 +136,8 @@ new settings. Coverage/config changes are surfaced as requiring a fresh scan.
 
 ## Qualification
 
-- `python -m pytest tests/ -q`: **500 passed, 12 skipped**, 15 dependency warnings.
-- With both local diagnostic render containers enabled: **524 passed**, 15 warnings.
+- `python -m pytest tests/ -q`: **508 passed, 12 skipped**, 15 dependency warnings.
+- With both local diagnostic render containers enabled: **532 passed**, 15 warnings.
 - Chrome offline checks at **1,100px** and a real emulated **390px** viewport:
   no horizontal overflow or overlapping discovery controls; no JavaScript errors;
   all 18 NudeNet controls remain present. Changing the contextual action updates
@@ -144,6 +150,26 @@ new settings. Coverage/config changes are surfaced as requiring a fresh scan.
   review. With `--gpu off` requested, that call took approximately **33 seconds**.
   Temporary dependencies/code were isolated, removed afterward, and the dedicated
   model instance was unloaded; daemon code and services were not changed.
+
+### Follow-up: output truncation regression
+
+A deployed scan's LM Studio logs showed a response at `2026-11-12 00:46:16`
+with `finish_reason=length` and exactly 900 completion tokens. A long explanation
+was cut off inside a JSON string. The old generic error obscured the cause.
+There were valid positive windows before this failure, but atomic activation
+correctly prevented publishing a partial generation. A failed scan is not a
+successful zero-detection result; an explicit clear/restart does not restore
+previously cleared scenes on failure.
+
+The fix bounds explanations in the JSON schema and validator, raises output
+headroom from 900 to 2,048 tokens and adds redacted failure/window diagnostics.
+A single local replay of the **same four logged images**, using the existing
+Qwen3.5-4B model in a dedicated CPU-loaded instance, finished normally in about
+22 seconds with **224 completion tokens**. All four observations passed validation;
+that particular window was clothed/towel-covered, not a nudity-positive window.
+No full scan, deployment, service restart or media modification was performed.
+The dedicated replay instance was unloaded; raw images were not exported into
+repository artifacts or diagnostic output.
 
 The real clip result is a limited wiring/candidate-detection check, **not** a
 false-positive/recall benchmark. No full movie rescan, frame-accurate scene-boundary

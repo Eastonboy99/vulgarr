@@ -50,7 +50,7 @@ def test_evidence_is_binary_uncertainty_derived_and_review_required(state, posit
     assert not resolve_action(DEFAULT_POLICY, e, action_override="blur").needs_review
 
 
-@pytest.mark.parametrize("failure", ["duplicate", "missing", "timestamp", "state", "review", "extra", "summary", "text"])
+@pytest.mark.parametrize("failure", ["duplicate", "missing", "timestamp", "state", "review", "extra", "summary", "long_summary", "text"])
 def test_rejects_untrusted_frame_ids_timestamps_and_decisions(failure):
     raw = observation()
     if failure == "duplicate": raw["frames"][1]["frame_id"] = "f0"
@@ -60,7 +60,8 @@ def test_rejects_untrusted_frame_ids_timestamps_and_decisions(failure):
     if failure == "review": raw["needs_review"] = False
     if failure == "extra": raw["frames"][0]["approve"] = True
     if failure == "summary": raw["window_summary"] = ""
-    if failure == "text": raw["frames"][0]["evidence"] = "x" * 1001
+    if failure == "long_summary": raw["window_summary"] = "x" * (c.MAX_SUMMARY_CHARS + 1)
+    if failure == "text": raw["frames"][0]["evidence"] = "x" * (c.MAX_EVIDENCE_CHARS + 1)
     with pytest.raises(ValueError): c.observations_to_evidence(raw, "mock")
 
 
@@ -86,7 +87,8 @@ def test_mixed_private_public_dns_rejected(monkeypatch):
     with pytest.raises(ValueError): asyncio.run(c.local_endpoint("http://desktop/v1"))
 
 
-@pytest.mark.parametrize("status,finish,valid", [(200, "stop", True), (302, "stop", False), (200, "length", False), (500, "stop", False)])
+@pytest.mark.parametrize("status,finish,valid", [(200, "stop", True), (302, "stop", False), (200, "length", False), (500, "stop", False),
+    (200, "content_filter", False), (200, "bad_json", False), (200, "bad_observations", False)])
 def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch, private_dns, status, finish, valid):
     calls, times, constructors = [], [], []
     def extract(binary, video, timestamp, target, **options):
@@ -99,7 +101,11 @@ def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch,
         async def __aexit__(self, *args): pass
         async def post(self, url, **options):
             calls.append((url, options))
-            return SimpleNamespace(status_code=status, json=lambda: {"choices": [{"finish_reason": finish, "message": {"content": json.dumps(observation())}}]})
+            raw = observation()
+            if finish == "bad_observations": raw["frames"][0]["frame_id"] = "unknown"
+            text = '{"frames":' if finish == "bad_json" else json.dumps(raw)
+            completed = "stop" if finish in ("bad_json", "bad_observations") else finish
+            return SimpleNamespace(status_code=status, json=lambda: {"choices": [{"finish_reason": completed, "message": {"content": text}}]})
     monkeypatch.setattr(c, "extract_frame", extract)
     monkeypatch.setattr(c.httpx, "AsyncClient", Client)
     args = dict(base_url="http://desktop:1234/v1", api_key="", model="mock", ffmpeg_bin="ffmpeg", video_path=tmp_path/"source", start=0, end=8)
@@ -108,6 +114,10 @@ def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch,
     else:
         with pytest.raises(ValueError) as err: asyncio.run(c.classify_window(**args))
         assert "desktop" not in str(err.value)
+        if finish == "length": assert "truncated" in str(err.value)
+        if finish == "bad_json": assert "malformed or incomplete JSON" in str(err.value)
+        if finish == "bad_observations": assert "invalid structured observations" in str(err.value)
+        if status != 200: assert f"HTTP {status}" in str(err.value)
     assert times == [1, 3, 5, 7]
     assert constructors[0]["trust_env"] is False
     assert constructors[0]["follow_redirects"] is False
@@ -115,6 +125,10 @@ def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch,
     payload = calls[0][1]["json"]
     assert payload["response_format"]["type"] == "json_schema"
     assert payload["reasoning_effort"] == "none"
+    assert payload["max_tokens"] == c.MAX_OUTPUT_TOKENS == 2048
+    schema = payload["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["frames"]["items"]["properties"]["evidence"]["maxLength"] == c.MAX_EVIDENCE_CHARS == 240
+    assert schema["properties"]["window_summary"]["maxLength"] == c.MAX_SUMMARY_CHARS == 240
     assert len(payload["messages"][0]["content"]) == 9
 
 
