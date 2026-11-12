@@ -165,7 +165,7 @@ async def scan_for_scenes(session: AsyncSession, title: Title, job_id: int,
     policy = validate_policy(await get_setting(session, "scene_content_policy"))
     selected = [label for label in NUDENET_LABELS if policy["actions"][category_id(label)] != "allow"]
     with detection_labels(selected):
-        return await _scan_for_scenes(session, title, job_id, on_progress, on_stage)
+        return await _scan_for_scenes(session, title, job_id, on_progress, on_stage, proposal_policy=policy)
 
 
 async def _scan_for_scenes(
@@ -174,6 +174,7 @@ async def _scan_for_scenes(
     job_id: int,
     on_progress: ScanProgressCallback | None = None,
     on_stage: StageCallback | None = None,
+    *, proposal_policy: dict | None = None,
 ) -> ScanOutcome:
     """Scan title's video for candidate explicit-content scenes.
 
@@ -221,7 +222,9 @@ async def _scan_for_scenes(
     scan_work_dir.mkdir(parents=True, exist_ok=True)
     resume_scores_path = scan_work_dir / "scores.jsonl"
     fingerprint_path = scan_work_dir / "fingerprint.txt"
-    policy = validate_policy(await get_setting(session, "scene_content_policy"))
+    # Match the exact policy bound by detection_labels(), including across the
+    # asynchronous local-endpoint preflight. Activation checks the latest policy.
+    policy = validate_policy(proposal_policy if proposal_policy is not None else await get_setting(session, "scene_content_policy"))
     selected = sorted(k for k in NUDENET_CATEGORIES if policy["actions"][k] != "allow")
     fingerprint = _scan_fingerprint(video_path, frame_interval, duration)
     fingerprint += hashlib.sha256(repr(selected).encode()).hexdigest()[:16]

@@ -116,7 +116,9 @@ an unchanged alias. Provider errors are redacted and never interpreted as safe c
 
 Both passes stage their results before one atomic activation. A failed local
 window, cancellation, superseded generation or changed discovery configuration
-retains the previous successful scene set. The existing explicit reset's
+retains the previous successful scene set. Detector scoring and recorded coverage
+share one policy snapshot even if preferences change during local-endpoint
+preflight; the final activation fence rejects the outdated selection. The existing explicit reset's
 intentional immediate-deletion semantics remain unchanged. Neither path edits
 original media, clean audio masters or the last published edit during scanning.
 
@@ -128,8 +130,8 @@ new settings. Coverage/config changes are surfaced as requiring a fresh scan.
 
 ## Qualification
 
-- `python -m pytest tests/ -q`: **499 passed, 12 skipped**, 15 dependency warnings.
-- With both local diagnostic render containers enabled: **523 passed**, 15 warnings.
+- `python -m pytest tests/ -q`: **500 passed, 12 skipped**, 15 dependency warnings.
+- With both local diagnostic render containers enabled: **524 passed**, 15 warnings.
 - Chrome offline checks at **1,100px** and a real emulated **390px** viewport:
   no horizontal overflow or overlapping discovery controls; no JavaScript errors;
   all 18 NudeNet controls remain present. Changing the contextual action updates

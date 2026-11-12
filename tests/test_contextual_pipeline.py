@@ -31,13 +31,19 @@ async def database(tmp_path):
     return engine, factory
 
 
-@pytest.mark.parametrize("mode", ["success", "failure", "changed_settings", "cancelled"])
+@pytest.mark.parametrize("mode", ["success", "failure", "changed_settings", "changed_labels", "cancelled"])
 def test_independent_discovery_with_no_nudenet_hits_and_atomic_activation(tmp_path, monkeypatch, mode):
     async def scenario():
         engine, factory = await database(tmp_path)
         async def probe(*args): return {"format": {"duration": "24"}}
         async def nudenet(*args, **kwargs): return []
-        async def local(*args): return None
+        current_session = []
+        async def local(*args):
+            if mode == "changed_labels":
+                policy = json.loads(json.dumps(DEFAULT_POLICY))
+                policy["actions"]["nudenet.BELLY_EXPOSED"] = "blur"
+                await set_setting(current_session[0], "scene_content_policy", policy)
+            return None
         async def forbidden(*args, **kwargs): raise AssertionError("NudeNet cannot refine or veto contextual discoveries")
         monkeypatch.setattr(pipeline, "probe", probe)
         monkeypatch.setattr(pipeline, "scan_video_frames", nudenet)
@@ -47,6 +53,7 @@ def test_independent_discovery_with_no_nudenet_hits_and_atomic_activation(tmp_pa
         monkeypatch.setattr(pipeline, "app_settings", SimpleNamespace(data_dir=tmp_path, ffprobe_bin="ffprobe", ffmpeg_bin="ffmpeg"))
         try:
             async with factory() as session:
+                current_session.append(session)
                 for key, value in {"scene_contextual_enabled": True, "scene_contextual_base_url": "http://private/v1", "scene_contextual_model": "mock", "scene_auto_process": True}.items():
                     await set_setting(session, key, value)
                 job = SceneJob(title_id=1, kind=SceneJobKind.scan, state=JobState.processing)
