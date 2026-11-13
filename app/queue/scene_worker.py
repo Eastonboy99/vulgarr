@@ -144,7 +144,9 @@ class SceneJobQueue:
                 if job is None or job.state not in (JobState.queued, JobState.processing):
                     return False, "Job is no longer running"
                 if job.state == JobState.processing and (job.progress_percent or 0) >= 97:
-                    return False, "Too far along to cancel -- finishing up"
+                    from app.scenes import protection
+                    if not await protection.enabled(session) or (job.progress_message or '').startswith('Publishing'):
+                        return False, "Too far along to cancel -- finishing up"
             task.cancel()
             return True, None
 
@@ -322,9 +324,62 @@ class SceneJobQueue:
                 return False
         return bool(await self.enqueue_claude_verify(title_id))
 
+    async def _recover_protection_handoffs(self):
+        """Recover scan/audio completion races and crashes before Apply enqueue.
+
+        Never start scans here or endlessly retry a terminal failed render.
+        """
+        from app.scenes import protection
+        from app.scenes.content_policy import scene_set_fingerprint, RENDER_SETTING_KEYS
+        ready, audio_requests = [], []
+        async with get_session() as session:
+            if not await protection.enabled(session):
+                return
+            cursor = getattr(self, '_protection_cursor', 0)
+            titles = (await session.execute(select(Title).where(Title.id > cursor,
+                Title.scene_analysis.like('%"protection":%'),
+                Title.scene_scan_status.in_(['scanned', 'no_scenes_found'])).order_by(Title.id).limit(25))).scalars().all()
+            self._protection_cursor = titles[-1].id if titles else 0
+            for title in titles:
+                try:
+                    await protection.readiness(session, title)
+                    if not await protection.audio_ready(session, title):
+                        latest = await session.scalar(select(ProcessingJob).where(ProcessingJob.title_id == title.id)
+                            .order_by(ProcessingJob.created_at.desc(), ProcessingJob.id.desc()).limit(1))
+                        if latest is None or latest.state == JobState.done:
+                            from app.integrations.subtitle_lookup import find_subtitle_for_video
+                            language = await get_setting(session, 'default_subtitle_language')
+                            if ((title.subtitle_path and Path(title.subtitle_path).is_file())
+                                    or find_subtitle_for_video(Path(title.video_path), language) is not None):
+                                audio_requests.append(title.id)
+                        continue
+                    scenes = (await session.execute(select(DetectedScene).where(DetectedScene.title_id == title.id))).scalars().all()
+                    policy = await get_setting(session, 'scene_content_policy')
+                    render = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
+                    if title.scene_set_applied == scene_set_fingerprint(scenes, policy, render) and title.vulgarr_edit_path and Path(title.vulgarr_edit_path).is_file():
+                        continue
+                    scan = await session.get(SceneJob, title.scene_scan_generation)
+                    failure = await session.scalar(select(SceneJob.id).where(SceneJob.title_id == title.id,
+                        SceneJob.kind == SceneJobKind.blur, SceneJob.state == JobState.failed,
+                        SceneJob.created_at >= scan.created_at).limit(1))
+                    if failure is None:
+                        ready.append(title.id)
+                except (protection.ProtectionNotReady, OSError):
+                    continue
+        for title_id in audio_requests:
+            from app.library import enqueue_if_not_already_active
+            from app.domain import TriggerSource
+            await enqueue_if_not_already_active(title_id, TriggerSource.manual)
+        for title_id in ready:
+            await self.enqueue_blur_if_not_already_active(title_id)
+
     async def _dispatch_loop(self) -> None:
+        recovery_at = 0
         while not self._stopping:
             try:
+                if time.monotonic() >= recovery_at:
+                    await self._recover_protection_handoffs()
+                    recovery_at = time.monotonic() + 10
                 async with get_session() as session:
                     cap = int(await get_setting(session, "scene_scan_concurrency_cap"))
                     off_hours_enabled = bool(await get_setting(session, "off_hours_enabled"))
@@ -497,9 +552,21 @@ class SceneJobQueue:
                     # approved. A concurrent manual scan-scenes/apply-scenes click
                     # can't double-enqueue here -- enqueue_blur_if_not_already_active
                     # checks for an existing queued/processing blur job first.
-                    if (scan_outcome.need_review_count == 0
-                            and (scan_outcome.candidate_count or title.vulgarr_edit_path)
-                            and bool(await get_setting(session, "scene_auto_process"))):
+                    from app.scenes import protection
+                    protected = await protection.enabled(session)
+                    protection_ready = True
+                    if protected:
+                        try:
+                            await protection.readiness(session, title)
+                        except protection.ProtectionNotReady as exc:
+                            protection_ready = False
+                            job.progress_message += ' · held: ' + str(exc)
+                        if not await protection.audio_ready(session, title):
+                            protection_ready = False
+                            job.progress_message += ' · waiting for clean-audio preparation'
+                    if (protection_ready and scan_outcome.need_review_count == 0
+                            and (protected or scan_outcome.candidate_count or title.vulgarr_edit_path)
+                            and (protected or bool(await get_setting(session, "scene_auto_process")))):
                         await session.commit()
                         await self.enqueue_blur_if_not_already_active(title.id)
                 elif is_claude_verify:

@@ -199,13 +199,21 @@ async def _scan_for_scenes(
     robust per-scene signal than the main scan's single peak_confidence value.
     Powers the review list's one-click "Approve high-confidence" bulk action.
     """
+    from app.scenes import protection
+    protected = await protection.enabled(session)
+    protection_revision = await protection.fingerprint(session) if protected else None
+    protection_source = protection.source_fingerprint(Path(title.video_path)) if protected else None
+    if protected and bool(await get_setting(session, "scene_semantic_enabled")):
+        raise ValueError("Protection-first mode requires NudeNet plus local contextual discovery, not legacy semantic analysis")
     contextual_config = await _contextual_config(session)
     if contextual_config["scene_contextual_enabled"]:
         contextual.validate_sampling(contextual_config["scene_contextual_window_seconds"], contextual_config["scene_contextual_timeout_seconds"])
         await contextual.local_endpoint(contextual_config["scene_contextual_base_url"])
-    auto_process = bool(await get_setting(session, "scene_auto_process"))
+    auto_process = protected or bool(await get_setting(session, "scene_auto_process"))
     confidence_threshold = float(await get_setting(session, "scene_confidence_threshold"))
     frame_interval = float(await get_setting(session, "scene_frame_interval_seconds"))
+    if protected:
+        frame_interval = min(frame_interval, protection.DETECTOR_INTERVAL)
     min_duration = float(await get_setting(session, "scene_min_duration_seconds"))
     merge_gap = float(await get_setting(session, "scene_merge_gap_seconds"))
     frame_concurrency = int(await get_setting(session, "scene_frame_classify_concurrency"))
@@ -247,12 +255,14 @@ async def _scan_for_scenes(
         on_status=on_stage,
     )
 
+    if protected:
+        protection.validate_detector_coverage(scores, duration, frame_interval)
     candidates = cluster_scenes(
         scores,
         confidence_threshold=confidence_threshold,
         frame_interval_seconds=frame_interval,
         merge_gap_seconds=merge_gap,
-        high_confidence_override=high_confidence_override,
+        high_confidence_override=confidence_threshold if protected else high_confidence_override,
     )
 
     # Each candidate's dense re-scan drives two things from the same data: the
@@ -299,7 +309,7 @@ async def _scan_for_scenes(
     for candidate, (start, end, frac), window_scores in zip(candidates, refined, all_window_scores):
         samples = window_scores or [s for s in scores if start <= s.timestamp <= end]
         evidence = nudenet_evidence(samples, confidence_threshold)
-        auto_approve = auto_process and evidence is not None and not evidence["uncertain"]
+        auto_approve = auto_process and evidence is not None and (protected or not evidence["uncertain"])
         status = SceneReviewStatus.approved if auto_approve else SceneReviewStatus.pending
         auto_approved_count += int(status == SceneReviewStatus.approved)
         need_review_count += int(status == SceneReviewStatus.pending)
@@ -317,6 +327,7 @@ async def _scan_for_scenes(
                 category_evidence=json.dumps(evidence) if evidence is not None else None,
                 detector_evidence=json.dumps({
                     "schema_version": 2, "backend": "nudenet", "semantic_coverage": [],
+                    "protection_conservative": protected, "automatic_decision": auto_approve,
                     "samples": [{"timestamp": s.timestamp, "detections": s.detections}
                         for s in (window_scores or [s for s in scores if start <= s.timestamp <= end])
                         if s.detections is not None],
@@ -331,7 +342,12 @@ async def _scan_for_scenes(
         raise ValueError("Detection label preferences changed during scanning; run a fresh scan")
     contextual_analysis = await _add_contextual_rows(session, title, job_id, staged_rows, scan_work_dir,
         fingerprint, duration, contextual_config, on_progress, on_stage)
-    need_review_count += contextual_analysis.pop("added_rows")
+    contextual_analysis.pop("added_rows")
+    if protected:
+        contextual_analysis["protection"] = {"fingerprint": protection_revision,
+            "source": protection_source, "generation": job_id, "complete": True}
+    auto_approved_count = sum(r.status == SceneReviewStatus.approved for r in staged_rows)
+    need_review_count = sum(r.status == SceneReviewStatus.pending for r in staged_rows)
     await _activate_scan(session, title.id, job_id, staged_rows, analysis={
         "schema_version": 1, "backend": "nudenet", "model": "NudeNet 3.4.2",
         **contextual_analysis,
@@ -360,7 +376,8 @@ def _progress_slice(callback, start, end):
 
 
 async def _contextual_config(session):
-    return {key: await get_setting(session, key) for key in contextual.KEYS}
+    from app.scenes.protection import context_config
+    return await context_config(session)
 
 
 async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerprint,
@@ -377,30 +394,45 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
         return analysis
     if on_stage:
         await on_stage("Independent local contextual-nudity discovery across the whole title (review required)")
-    windows = await contextual.scan_contextual_windows(video_path=Path(title.video_path), duration=duration,
+    from app.scenes import protection
+    protected = await protection.enabled(session)
+    if protected:
+        if on_stage:
+            await on_stage("Protection-first discovery, shot checks and conservative local rechecks")
+        windows, coverage = await protection.analyze_windows(video_path=Path(title.video_path), duration=duration,
+            checkpoint_dir=work_dir / "protection", fingerprint=fingerprint, config=config,
+            policy=await get_setting(session, "scene_content_policy"), on_progress=_progress_slice(on_progress, .35, .99))
+        analysis["protection_coverage"] = coverage
+    else:
+        windows = await contextual.scan_contextual_windows(video_path=Path(title.video_path), duration=duration,
         checkpoint_dir=work_dir, fingerprint=fingerprint,
         base_url=config["scene_contextual_base_url"], api_key=config["scene_contextual_api_key"],
         model=config["scene_contextual_model"], ffmpeg_bin=app_settings.ffmpeg_bin,
         window_seconds=config["scene_contextual_window_seconds"],
         timeout_seconds=config["scene_contextual_timeout_seconds"], on_progress=_progress_slice(on_progress, .35, .99))
     policy = await get_setting(session, "scene_content_policy")
-    blockers = merge_intervals([(r.start_seconds, r.end_seconds) for r in rows
-        if scene_decision(r, policy).action != Action.allow], merge_gap_seconds=0)
+    blockers = [(r.start_seconds, r.end_seconds, scene_decision(r, policy).action) for r in rows]
     groups = []
     for start, end, evidence in windows:
         if not evidence["labels"] and not evidence["uncertain"]:
             continue
-        if (groups and abs(groups[-1][1] - start) < 1e-6
+        if (groups and start <= groups[-1][1] + 1e-6
                 and groups[-1][2]["labels"] == evidence["labels"]
                 and groups[-1][2]["uncertain"] == evidence["uncertain"]):
-            groups[-1][1] = end
+            groups[-1][1] = max(groups[-1][1], end)
             groups[-1][3] += 1
+            groups[-1][4].append({"start": start, "end": end, "evidence": evidence})
         else:
-            groups.append([start, end, dict(evidence), 1])
+            groups.append([start, end, dict(evidence), 1, [{"start": start, "end": end, "evidence": evidence}]])
     added = 0
-    for start, end, evidence, count in groups:
+    for start, end, evidence, count, observations in groups:
         segments = [(start, end)]
-        for left, right in blockers:
+        from app.scenes.content_policy import resolve_action
+        requested_action = resolve_action(policy, evidence, conservative=protected).action
+        for left, right, blocking_action in blockers:
+            if (blocking_action == Action.allow or requested_action == Action.allow
+                    or requested_action == Action.blur_mute and blocking_action != Action.blur_mute):
+                continue
             remainder = []
             for a, b in segments:
                 if right <= a or left >= b:
@@ -411,7 +443,8 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
                     if right < b:
                         remainder.append((right, b))
             segments = remainder
-        evidence["explanation"] = (f"Local AI candidate across {count} sampled window(s); human review required. " + evidence["explanation"])[:1000]
+        evidence["explanation"] = (f"Local AI candidate across {count} sampled window(s); " +
+            ("protection-first automatic decision. " if protected else "human review required. ") + evidence["explanation"])[:1000]
         for a, b in segments:
             if b - a < 1e-6:
                 continue
@@ -421,12 +454,14 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
                 verified_fraction=None, category_evidence=json.dumps(evidence),
                 detector_evidence=json.dumps({"backend": "local-contextual", "version": contextual.VERSION,
                     "window_seconds": config["scene_contextual_window_seconds"],
-                    "fractions": contextual.FRACTIONS, "window_count": count}),
-                mute_audio=False, status=SceneReviewStatus.pending, source="detected"))
+                    "fractions": contextual.FRACTIONS, "window_count": count, "windows": observations,
+                    "protection_conservative": protected, "automatic_decision": protected}),
+                mute_audio=False, status=SceneReviewStatus.approved if protected else SceneReviewStatus.pending,
+                reviewed_at=datetime.datetime.utcnow() if protected else None, source="detected"))
             added += 1
     analysis.update(added_rows=added, contextual={"model": config["scene_contextual_model"],
         "windows": len(windows), "window_seconds": config["scene_contextual_window_seconds"],
-        "samples_per_window": len(contextual.FRACTIONS), "review_required": True})
+        "samples_per_window": len(contextual.FRACTIONS), "review_required": not protected})
     return analysis
 
 
@@ -459,11 +494,33 @@ async def _activate_scan(session: AsyncSession, title_id: int, job_id: int,
         if enabled != sorted(set(analysis["coverage"]) & NUDENET_CATEGORIES):
             await session.rollback()
             raise ValueError("Detection label preferences changed during scanning; previous scenes retained")
+    from app.scenes import protection
+    if bool(analysis and "protection" in analysis) != await protection.enabled(session):
+        await session.rollback()
+        raise ValueError("Protection-first mode changed during scanning; previous scenes retained")
+    if analysis and "protection" in analysis:
+        if (analysis["protection"]["fingerprint"] != await protection.fingerprint(session)
+                or analysis["protection"]["source"] != protection.source_fingerprint(Path((await session.get(Title, title_id)).video_path))):
+            await session.rollback()
+            raise ValueError("Protection-first policy, source or sampling changed during scanning; previous scenes retained")
     conditions = [DetectedScene.title_id == title_id]
     if job.keep_manual:
         conditions.append(DetectedScene.source != "manual")
     previous = await session.execute(select(DetectedScene).where(*conditions))
     for scene in previous.scalars():
+        try:
+            provenance = json.loads(scene.detector_evidence or "{}")
+        except (ValueError, TypeError):
+            provenance = {}
+        if not isinstance(provenance, dict):
+            provenance = {}
+        if analysis and "protection" in analysis and (scene.source == "manual" or scene.action_override is not None
+                or scene.audio_override is not None or scene.status == SceneReviewStatus.rejected
+                or provenance.get("human_reviewed") is True
+                or (scene.status == SceneReviewStatus.approved and not provenance.get("automatic_decision"))):
+            # Keep explicit human intent across automated rescans. Rendering/output
+            # checks honor rejected/allowed intervals instead of overriding them.
+            continue
         await session.delete(scene)
     for row in rows:
         if row.id is None:
@@ -583,10 +640,31 @@ async def apply_scene_blur(
         )
     )
     scenes = result.scalars().all()
+    from app.scenes import protection
+    protected = await protection.enabled(session)
+    if protected:
+        await session.refresh(title)
+        await protection.readiness(session, title)
+        if audio_source_path is None and not await protection.audio_ready(session, title):
+            raise protection.ProtectionNotReady("Clean audio is not ready or an audio job is active; publication deferred")
     policy = await get_setting(session, "scene_content_policy")
     render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
     set_revision = scene_set_fingerprint(scenes, policy, render_settings)
     requested_generation = getattr(title, "scene_scan_generation", None)
+    protection_revision = await protection.fingerprint(session) if protected else None
+    def exceptions(all_scenes):
+        return sorted((s.start_seconds, s.end_seconds) for s in all_scenes
+            if s.status == SceneReviewStatus.rejected or s.action_override == "allow")
+    ignored = exceptions((await session.execute(select(DetectedScene).where(DetectedScene.title_id == title.id))).scalars().all()) if protected else []
+    mute_exceptions = sorted((s.start_seconds, s.end_seconds) for s in (await session.execute(select(DetectedScene).where(DetectedScene.title_id == title.id))).scalars().all()
+        if s.audio_override is False or (s.action_override == "blur" and s.audio_override is not True)) if protected else []
+    def subtract(windows, excluded=None):
+        pieces = [(w.start, w.end) for w in windows]
+        for a,b in ignored if excluded is None else excluded:
+            pieces = [(x,y) for s,t in pieces for x,y in
+                ([(s,t)] if b <= s or a >= t else [(s,min(t,a)),(max(s,b),t)]) if y > x]
+        return [MuteInterval(start=a,end=b) for a,b in pieces]
+    all_approved_scenes = list(scenes)
     decisions = {s.id: scene_decision(s, policy) for s in scenes}
     scenes = [s for s in scenes if decisions[s.id].action != Action.allow]
     # Empty effective sets deliberately rebuild from source/clean master,
@@ -635,6 +713,8 @@ async def apply_scene_blur(
         )
         mute_intervals = [MuteInterval(start=s, end=e) for s, e in mute_merged]
 
+    if protected:
+        blur_intervals, mute_intervals = subtract(blur_intervals), subtract(mute_intervals, ignored + mute_exceptions)
     video_crf = int(await get_setting(session, "blur_video_crf"))
     video_preset = await get_setting(session, "blur_video_preset")
     blur_radius = int(await get_setting(session, "scene_blur_radius"))
@@ -662,9 +742,16 @@ async def apply_scene_blur(
 
         video_progress = _scaled_progress
 
+    if protected and on_progress is not None:
+        async def protected_video_progress(fraction):
+            await on_progress(fraction * (.45 if mute_intervals else .6))
+        video_progress = protected_video_progress
+
     from app.output import source_fingerprint, title_edit_destination
     output_path = output_path or await title_edit_destination(session, title, app_settings.media_root)
     output_options = {}
+    if protected and output_path is None:
+        raise protection.ProtectionNotReady("Protection-first mode requires a configured clean output folder for this title")
     if output_path is not None:
         output_options['output_path'] = output_path
         if audio_source_path is not None:
@@ -690,9 +777,21 @@ async def apply_scene_blur(
         ).values(scene_scan_status=Title.scene_scan_status))
         if not lock.rowcount:
             raise ValueError("Scene generation changed during Apply; previous edit retained")
+        if await protection.enabled(session) != protected:
+            raise ValueError("Protection-first mode changed during Apply; previous edit retained")
+        if protected and isinstance(job_id, int):
+            active_job = await session.get(SceneJob, job_id, populate_existing=True)
+            if active_job is not None and active_job.state not in (JobState.queued, JobState.processing):
+                raise ValueError("Apply was cancelled or completed; previous edit retained")
         current = (await session.execute(select(DetectedScene).where(
             DetectedScene.title_id == title.id,
         ).execution_options(populate_existing=True))).scalars().all()
+        if protected:
+            await session.refresh(title)
+            await protection.readiness(session, title)
+            if (protection_revision != await protection.fingerprint(session) or exceptions(current) != ignored
+                    or sorted((s.start_seconds, s.end_seconds) for s in current if s.audio_override is False or (s.action_override == "blur" and s.audio_override is not True)) != mute_exceptions):
+                raise protection.ProtectionNotReady("Protection-first configuration or manual exceptions changed during rendering")
         current_policy = await get_setting(session, "scene_content_policy")
         current_render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
         current_generation = (await session.execute(select(Title.scene_scan_generation).where(
@@ -702,28 +801,77 @@ async def apply_scene_blur(
                 or scene_set_fingerprint(current, current_policy, current_render_settings) != set_revision):
             raise ValueError("Scene decisions or policy changed during Apply; previous published edit retained")
 
-    final_path = await apply_blur(
-        video_path=Path(title.video_path),
-        **output_options,
-        blur_intervals=blur_intervals,
-        mute_intervals=mute_intervals,
-        ffmpeg_bin=app_settings.ffmpeg_bin,
-        ffprobe_bin=app_settings.ffprobe_bin,
-        video_crf=video_crf,
-        video_preset=video_preset,
-        work_dir=work_dir,
-        blur_radius=blur_radius,
-        blur_power=blur_power,
-        on_progress=video_progress,
-        on_stage=on_stage,
-        before_publish=validate_current_set,
-    )
+    async def verification_progress(done,total):
+        if on_progress is not None and total:
+            await on_progress(.65 + .3*done/total)
 
+    async def validate_output(path):
+        findings = await protection.output_findings(session=session, title=title, path=path,
+            work_dir=work_dir / "output-check", policy=policy,
+            duration=float((await probe(app_settings.ffprobe_bin, Path(title.video_path)))["format"]["duration"]),
+            ignored=ignored, covered=[(w.start,w.end) for w in blur_intervals], on_progress=verification_progress)
+        if findings:
+            raise protection.ResidualContentError(findings)
+
+    for attempt in range(protection.OUTPUT_RETRIES + 1 if protected else 1):
+        try:
+            final_path = await apply_blur(
+                video_path=Path(title.video_path),
+                **output_options,
+                blur_intervals=blur_intervals,
+                mute_intervals=mute_intervals,
+                ffmpeg_bin=app_settings.ffmpeg_bin,
+                ffprobe_bin=app_settings.ffprobe_bin,
+                video_crf=video_crf,
+                video_preset=video_preset,
+                work_dir=work_dir,
+                blur_radius=blur_radius,
+                blur_power=blur_power,
+                on_progress=video_progress,
+                on_stage=on_stage,
+                before_publish=validate_current_set,
+                **({"validate_output": validate_output} if protected else {}),
+            )
+            break
+        except protection.ResidualContentError as exc:
+            if attempt >= protection.OUTPUT_RETRIES:
+                raise
+            # Fence user edits BEFORE recording/rendering additional automatic coverage.
+            await validate_current_set()
+            now = datetime.datetime.utcnow()
+            for a,b,evidence in exc.findings:
+                if any(w.start <= a and w.end >= b for w in blur_intervals):
+                    continue  # Existing coverage needs stronger blur, not duplicate rows.
+                scene = DetectedScene(id=secrets.randbits(62)+1, title_id=title.id,
+                    scan_generation=requested_generation, start_seconds=a, end_seconds=b,
+                    peak_confidence=max(evidence["labels"].values(), default=0),
+                    category_evidence=json.dumps(evidence), detector_evidence=json.dumps({
+                        "backend": "local-output-correction", "automatic_decision": True, "protection_conservative": True}),
+                    status=SceneReviewStatus.approved, reviewed_at=now, mute_audio=False, source="detected")
+                session.add(scene)
+                scenes.append(scene)
+                all_approved_scenes.append(scene)
+                action = scene_decision(scene, policy)
+                blur_intervals.append(MuteInterval(start=max(0,a-blur_pad_start),end=b+blur_pad_end))
+                if action.mute_audio:
+                    mute_intervals.append(MuteInterval(start=max(0,a-blur_pad_start),end=b+blur_pad_end))
+            blur_intervals = subtract([MuteInterval(start=a,end=b) for a,b in merge_intervals([(w.start,w.end) for w in blur_intervals], merge_gap_seconds=0)])
+            mute_intervals = subtract([MuteInterval(start=a,end=b) for a,b in merge_intervals([(w.start,w.end) for w in mute_intervals], merge_gap_seconds=0)], ignored + mute_exceptions)
+            set_revision = scene_set_fingerprint(all_approved_scenes, policy, render_settings)
+            await session.commit()
+            blur_radius, blur_power = max(90,blur_radius), max(8,blur_power)
+            # Reuse neither old rendered segments nor their weaker blur parameters.
+            work_dir = work_dir / "correction"
     now = datetime.datetime.utcnow()
     title.vulgarr_edit_path = str(final_path)
     title.vulgarr_edit_generated_at = now
     title.scene_policy_applied = policy_fingerprint(policy)
     title.scene_set_applied = set_revision
+    if protected:
+        analysis = json.loads(title.scene_analysis)
+        analysis["protection"]["output_validation"] = {"passed": True, "attempts": attempt + 1,
+            "blur_radius": blur_radius, "blur_power": blur_power, "checked_at": now.isoformat()}
+        title.scene_analysis = json.dumps(analysis)
     for scene in scenes:
         scene.applied_at = now
 
@@ -744,6 +892,8 @@ async def apply_scene_blur(
 
     if commit:
         await session.commit()
+    if protected:
+        shutil.rmtree(app_settings.data_dir / "blur_work" / str(job_id), ignore_errors=True)
 
     return BlurOutcome(output_path=final_path, scene_count=len(scenes))
 
@@ -765,6 +915,8 @@ async def reverify_scenes_with_claude(
     A failed call retains its previous status and records only a safe failure
     marker. Existing published media is never modified by this operation.
     """
+    if bool(await get_setting(session, "scene_protection_enabled")):
+        raise ValueError("Protection-first mode uses its own local rechecks; legacy candidate verification is disabled")
     semantic_enabled = bool(await get_setting(session, "scene_semantic_enabled"))
     legacy_enabled = bool(await get_setting(session, "claude_vision_verify_enabled"))
     if not semantic_enabled and not legacy_enabled:

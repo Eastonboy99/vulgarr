@@ -111,7 +111,7 @@ def validate_evidence(value: dict) -> dict:
     recall between sampled frames. Missing labels within coverage mean absent.
     """
     required = {"schema_version", "labels", "coverage", "uncertain", "explanation", "model"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold"}:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold", "observations"}:
         raise ValueError("Invalid evidence fields")
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise ValueError("Unsupported evidence schema")
@@ -126,6 +126,17 @@ def validate_evidence(value: dict) -> dict:
         if (set(value["coverage"]) != NUDENET_CATEGORIES or type(threshold) not in (int, float)
                 or not math.isfinite(threshold) or not 0 <= threshold <= 1):
             raise ValueError("Invalid detector confidence threshold")
+    if "observations" in value:
+        observations = value["observations"]
+        states = {"exposed_nudity", "contextual_nudity", "towel_sheet_covered", "swimwear_underwear", "clothed", "ambiguous_bare_skin", "no_people", "uncertain"}
+        if (set(value["coverage"]) != CONTEXTUAL_CATEGORIES or not isinstance(observations, list)
+                or len(observations) != 4 or any(not isinstance(r, dict) for r in observations)
+                or sorted(str(r.get("frame_id")) for r in observations) != ["f0", "f1", "f2", "f3"]):
+            raise ValueError("Invalid contextual observations")
+        for row in observations:
+            if (set(row) != {"frame_id", "state", "evidence"} or row["state"] not in states
+                    or not isinstance(row["evidence"], str) or not row["evidence"].strip() or len(row["evidence"]) > 240):
+                raise ValueError("Invalid contextual observation")
     for confidence in value["labels"].values():
         if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("Confidence must be finite and between zero and one")
@@ -147,7 +158,8 @@ class Decision:
 
 
 def resolve_action(policy: dict, evidence: dict | None, *, audio_override: bool | None = None,
-                   action_override: str | None = None, legacy_mute: bool = False) -> Decision:
+                   action_override: str | None = None, legacy_mute: bool = False,
+                   conservative: bool = False) -> Decision:
     """Resolve explicit scene intent first, then the union of category matches.
 
     Legacy/manual windows without evidence retain visual filtering; they are
@@ -167,6 +179,8 @@ def resolve_action(policy: dict, evidence: dict | None, *, audio_override: bool 
         validate_evidence(evidence)
         threshold = evidence.get("confidence_threshold", 0.5)
         matched = [policy["actions"][k] for k, score in evidence["labels"].items() if score >= threshold]
+        if conservative and evidence["uncertain"]:
+            matched += [policy["actions"][k] for k in evidence["coverage"]]
         action = (Action.blur_mute if "blur_mute" in matched else
                   Action.blur if "blur" in matched else Action.allow)
         review = set(evidence["coverage"]) == CONTEXTUAL_CATEGORIES or evidence["uncertain"] or (set(evidence["coverage"]) == VISUAL_CATEGORIES
@@ -209,7 +223,7 @@ def scene_set_fingerprint(scenes, policy: dict, render_settings: dict | None = N
         status = getattr(scene.status, "value", scene.status)
         if status == "approved":
             decision = scene_decision(scene, policy)
-            rows.append((scene.id, scene.start_seconds, scene.end_seconds, decision.action.value))
+            rows.append((scene.id, float(scene.start_seconds), float(scene.end_seconds), decision.action.value))
     return hashlib.sha256(json.dumps({"rows": sorted(rows), "render": render_settings or {}},
                                      sort_keys=True).encode()).hexdigest()
 
@@ -217,9 +231,14 @@ def scene_set_fingerprint(scenes, policy: dict, render_settings: dict | None = N
 def scene_decision(scene, policy: dict) -> Decision:
     """Shared ORM adapter for review previews and every render entry point."""
     raw = getattr(scene, "category_evidence", None)
+    try:
+        provenance = json.loads(getattr(scene, "detector_evidence", None) or "{}")
+    except (ValueError, TypeError):
+        provenance = {}
     return resolve_action(
         policy, json.loads(raw) if raw else None,
         audio_override=getattr(scene, "audio_override", None),
         action_override=getattr(scene, "action_override", None),
         legacy_mute=bool(getattr(scene, "mute_audio", False)),
+        conservative=isinstance(provenance, dict) and provenance.get("protection_conservative") is True,
     )

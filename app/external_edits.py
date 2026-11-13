@@ -14,10 +14,10 @@ import math
 import uuid
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings as app_settings
-from app.db.models import DetectedScene, SceneReviewStatus
+from app.db.models import DetectedScene, SceneReviewStatus, Title
 from app.domain import parse_index_list, serialize_index_list
 from app.mux.remux import RemuxError, _audio_streams, _run, probe
 from app.mux.tempfiles import remove_orphaned_temp_files
@@ -169,7 +169,21 @@ async def process_external_video(session, *, title, job_id: int, destination: Pa
         # Reviews can change during a long audio pass. Use the current set
         # when deciding whether a combined rebuild is still needed.
         approved = await session.scalar(approved_query)
-        if approved is not None:
+        from app.scenes import protection
+        protected = await protection.enabled(session)
+        ready = True
+        if protected:
+            try:
+                await session.refresh(title)
+                await protection.readiness(session, title)
+            except protection.ProtectionNotReady:
+                ready = False
+        if not ready:
+            # Keep the new clean master, but NEVER expose an audio-only copy
+            # before visual qualification. Scan completion/recovery chains Apply.
+            if stage is not None:
+                await stage('Clean audio ready; awaiting protection-first visual analysis')
+        elif approved is not None or protected:
             # Only the audio master is needed from this full-video staging
             # file. Release its space before building the blurred replacement,
             # rather than keeping two new multi-GB video outputs alive at once.
@@ -182,6 +196,9 @@ async def process_external_video(session, *, title, job_id: int, destination: Pa
         else:
             if stage is not None:
                 await stage('Publishing Vulgarr Edit')
+            await session.execute(update(Title).where(Title.id == title.id).values(scene_scan_status=Title.scene_scan_status))
+            if await protection.enabled(session):
+                raise protection.ProtectionNotReady('Protection-first mode changed during audio processing; previous edit retained')
             await publish_file(staged, destination)
             title.vulgarr_edit_path = str(destination)
             title.vulgarr_edit_generated_at = datetime.datetime.utcnow()

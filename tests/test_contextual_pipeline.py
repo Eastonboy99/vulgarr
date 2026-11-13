@@ -151,6 +151,8 @@ def test_overlapping_detector_coverage_subtracted_without_losing_missing_segment
     async def scan(**options):
         return [(0, 8, evidence()), (8, 16, evidence()), (16, 24, evidence("uncertain"))]
     monkeypatch.setattr(pipeline, "get_setting", get_setting)
+    from app.scenes import protection
+    monkeypatch.setattr(protection, "get_setting", get_setting)
     monkeypatch.setattr(contextual, "scan_contextual_windows", scan)
     config = {key: DEFAULT_SETTINGS[key] for key in contextual.KEYS}
     config.update(scene_contextual_enabled=True, scene_contextual_model="mock")

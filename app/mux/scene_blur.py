@@ -51,6 +51,7 @@ that's treated as fully stale and wiped, never partially trusted.
 """
 
 import asyncio
+import math
 import bisect
 import hashlib
 import logging
@@ -1918,9 +1919,29 @@ async def verify_blurred_output(
 
     orig_duration = float(original_probe["format"].get("duration", 0))
     new_duration = float(new_probe["format"].get("duration", 0))
+    if not math.isfinite(orig_duration) or not math.isfinite(new_duration) or min(orig_duration,new_duration) < 0:
+        raise RemuxError("Output duration is not finite and nonnegative")
     if orig_duration and abs(orig_duration - new_duration) > 2.0:
         raise RemuxError(f"Duration mismatch for {tmp_path}: original={orig_duration:.1f}s new={new_duration:.1f}s")
 
+    # Counts alone can miss replacement/loss of a playback track. Compare
+    # stream types, audio layouts and relative A/V starts where reported.
+    from collections import Counter
+    if Counter(s.get("codec_type") for s in original_probe["streams"]) != Counter(s.get("codec_type") for s in new_probe["streams"]):
+        raise RemuxError("Output stream types changed")
+    for kind in ("video", "audio"):
+        before = [s for s in original_probe["streams"] if s.get("codec_type") == kind]
+        after = [s for s in new_probe["streams"] if s.get("codec_type") == kind]
+        for a,b in zip(before, after):
+            if kind == "audio":
+                for key in ("sample_rate", "channels"):
+                    if a.get(key) is not None and b.get(key) is not None and str(a[key]) != str(b[key]):
+                        raise RemuxError(f"Output audio {key} changed")
+            if a.get("start_time") is not None and b.get("start_time") is not None:
+                old_start = float(a["start_time"]) - float(original_probe["format"].get("start_time", 0))
+                new_start = float(b["start_time"]) - float(new_probe["format"].get("start_time", 0))
+                if not math.isfinite(old_start) or not math.isfinite(new_start) or abs(old_start-new_start) > .25:
+                    raise RemuxError("Output playback stream timing shifted")
     await verify_packet_interleaving(ffprobe_bin, tmp_path)
 
     # Decode a window spanning EVERY blurred scene, not just the first --
@@ -1937,7 +1958,10 @@ async def verify_blurred_output(
     # interest, though see _BENIGN_DECODE_WARNING_RE below for why this
     # alone isn't what actually keeps this check honest.
     _WINDOW_LOOKBACK_SECONDS = 6.0
-    for window in blurred_windows:
+    check_windows = list(blurred_windows)
+    check_windows.extend(MuteInterval(start=max(w.start,w.end-.001),end=w.end)
+        for w in blurred_windows if w.end-w.start > 11)
+    for window in check_windows:
         check_start = max(0.0, window.start - _WINDOW_LOOKBACK_SECONDS)
         check_duration = min(19.0, (window.end - window.start) + _WINDOW_LOOKBACK_SECONDS + 2.0)
         code, _out, err = await _run(
@@ -1973,6 +1997,7 @@ async def apply_blur(
     output_path: Path | None = None,
     audio_source_path: Path | None = None,
     before_publish: Callable[[], Awaitable[None]] | None = None,
+    validate_output: Callable[[Path], Awaitable[None]] | None = None,
 ) -> Path:
     """work_dir: a persistent directory (see app.scenes.pipeline.apply_scene_blur
     for how it's derived from the SceneJob id) that build_blurred_video reuses
@@ -2052,6 +2077,10 @@ async def apply_blur(
 
     final_path = output_path or sibling_edit_path(video_path)
     try:
+        if validate_output is not None:
+            if on_stage is not None:
+                await on_stage("Local protection-first output content verification")
+            await validate_output(tmp_path)
         if on_stage is not None:
             await on_stage("Publishing Vulgarr Edit")
         if before_publish is not None:

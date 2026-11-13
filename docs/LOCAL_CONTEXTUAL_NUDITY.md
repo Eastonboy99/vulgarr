@@ -1,5 +1,10 @@
 # Independent local contextual-nudity discovery
 
+**Default workflow:** review-first. For opt-in hands-off conservative decisions,
+denser/shot-based sampling, automatic rendering and output qualification, see
+[Protection-first automation](PROTECTION_FIRST_AUTOMATION.md). The sampling and
+review instructions below describe the default unless noted otherwise.
+
 ## What changes
 
 NudeNet detects body parts, not the general concept of a person being nude with
@@ -83,10 +88,11 @@ scene decisions. Use the action control/review/Apply to change existing edits.
   never supplies trusted timestamps, approval, filtering commands or confidence.
   Binary presence is shown as an **AI flag**, not a misleading 100% confidence.
 - Uncertainty is derived from per-frame states, never a model's own review flag.
-  Every new contextual candidate requires human approval. It has no invented
+  Every new contextual candidate requires human approval unless protection-first
+  automation is explicitly enabled. It has no invented
   NudeNet verification fraction and cannot enter high-confidence auto-approval.
-- Adjacent equivalent contextual windows coalesce. Already-blocking detector
-  intervals are subtracted, preserving newly discovered portions without
+- Adjacent equivalent contextual windows coalesce. Detector intervals with an
+  equivalent or stronger filtering action are subtracted, preserving newly discovered portions without
   duplicate overlaps or changing NudeNet's evidence/approval. Contextual windows
   are not passed through NudeNet's dense verifier: lack of visible anatomy must
   not erase an obscured-nudity proposal.
@@ -136,8 +142,8 @@ new settings. Coverage/config changes are surfaced as requiring a fresh scan.
 
 ## Qualification
 
-- `python -m pytest tests/ -q`: **508 passed, 12 skipped**, 15 dependency warnings.
-- With both local diagnostic render containers enabled: **532 passed**, 15 warnings.
+- `python -m pytest tests/ -q`: **581 passed, 12 skipped**, 17 dependency warnings.
+- With both local diagnostic render containers enabled: **605 passed**, 17 warnings.
 - Chrome offline checks at **1,100px** and a real emulated **390px** viewport:
   no horizontal overflow or overlapping discovery controls; no JavaScript errors;
   all 18 NudeNet controls remain present. Changing the contextual action updates

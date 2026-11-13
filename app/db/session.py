@@ -201,6 +201,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scene_semantic_enabled": False,
     "scene_semantic_window_seconds": 10.0,
     # Independent discovery, never gated by NudeNet hits. Local endpoints only.
+    "scene_protection_enabled": False,
     "scene_contextual_enabled": False,
     "scene_contextual_base_url": "",
     "scene_contextual_api_key": "",

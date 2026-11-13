@@ -25,6 +25,17 @@ router = APIRouter(tags=["scenes"])
 templates = Jinja2Templates(directory="app/templates")
 
 
+def _mark_human(scene):
+    try:
+        metadata = json.loads(scene.detector_evidence or "{}")
+    except (ValueError, TypeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.update(automatic_decision=False, human_reviewed=True)
+    scene.detector_evidence = json.dumps(metadata)
+
+
 async def _scene_review_context(session, title_id: int) -> dict:
     title = await session.get(Title, title_id)
     scenes_result = await session.execute(
@@ -35,15 +46,24 @@ async def _scene_review_context(session, title_id: int) -> dict:
     render_settings = {key: await get_setting(session, key) for key in RENDER_SETTING_KEYS}
     expected_coverage = (VISUAL_CATEGORIES if await get_setting(session, "scene_semantic_enabled") else
                          {k for k in NUDENET_CATEGORIES if policy["actions"][k] != "allow"})
-    context_enabled = bool(await get_setting(session, "scene_contextual_enabled"))
+    from app.scenes import protection
+    config = await protection.context_config(session)
+    protected = await protection.enabled(session)
+    context_enabled = bool(config["scene_contextual_enabled"])
     analysis = json.loads(title.scene_analysis) if title and title.scene_analysis else None
     context_stale = False
     if context_enabled:
         expected_coverage = set(expected_coverage) | CONTEXTUAL_CATEGORIES
-        config = {key: await get_setting(session, key) for key in contextual.KEYS}
         context_stale = not analysis or analysis.get("contextual_fingerprint") != contextual.config_fingerprint(config)
+    if protected:
+        context_stale = context_stale or not analysis or analysis.get("protection", {}).get("fingerprint") != await protection.fingerprint(session)
     category_counts = {}
     for scene in scenes:
+        try:
+            provenance = json.loads(scene.detector_evidence or "{}")
+        except (ValueError, TypeError):
+            provenance = {}
+        scene.protection_automatic = isinstance(provenance, dict) and provenance.get("automatic_decision") is True and provenance.get("protection_conservative") is True
         scene.effective_decision = scene_decision(scene, policy)
         evidence = json.loads(scene.category_evidence) if scene.category_evidence else None
         scene.evidence_display = evidence
@@ -116,7 +136,7 @@ async def _scene_review_context(session, title_id: int) -> dict:
         "scan_job": scan_job,
         "blur_job": blur_job,
         "claude_verify_job": claude_verify_job,
-        "claude_vision_verify_enabled": bool(await get_setting(session, "claude_vision_verify_enabled")) or bool(await get_setting(session, "scene_semantic_enabled")),
+        "claude_vision_verify_enabled": not protected and (bool(await get_setting(session, "claude_vision_verify_enabled")) or bool(await get_setting(session, "scene_semantic_enabled"))),
         "claude_reverifiable_count": claude_reverifiable_count,
         "vulgarr_edit_path": title.vulgarr_edit_path if title else None,
         "high_confidence_fraction": high_confidence_fraction,
@@ -444,6 +464,7 @@ async def approve_scene(
         if scene is not None:
             scene.status = SceneReviewStatus.approved
             scene.reviewed_at = datetime.datetime.utcnow()
+            _mark_human(scene)
             await session.commit()
     if resolved_title_id is None:
         return HTMLResponse("")
@@ -460,6 +481,7 @@ async def reject_scene(
         if scene is not None:
             scene.status = SceneReviewStatus.rejected
             scene.reviewed_at = datetime.datetime.utcnow()
+            _mark_human(scene)
             await session.commit()
     if resolved_title_id is None:
         return HTMLResponse("")
@@ -539,6 +561,7 @@ async def approve_high_confidence_scenes(request: Request, title_id: int, detail
             if not scene_decision(scene, policy).needs_review:
                 scene.status = SceneReviewStatus.approved
                 scene.reviewed_at = now
+                _mark_human(scene)
         await session.commit()
     return await _render_scene_review(request, title_id, detail_view)
 
@@ -561,6 +584,7 @@ async def approve_all_scenes(request: Request, title_id: int, detail_view: bool 
         for scene in result.scalars().all():
             scene.status = SceneReviewStatus.approved
             scene.reviewed_at = now
+            _mark_human(scene)
         await session.commit()
     return await _render_scene_review(request, title_id, detail_view)
 
@@ -692,6 +716,7 @@ async def adjust_scene(
                     duration = None
             scene.start_seconds = max(0.0, start_seconds)
             scene.end_seconds = min(end_seconds, duration) if duration else end_seconds
+            _mark_human(scene)
             await session.commit()
     if resolved_title_id is None:
         return HTMLResponse("")

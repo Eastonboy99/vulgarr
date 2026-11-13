@@ -371,6 +371,7 @@ async def _scan_frames(
     clip_duration: float | None = None,
     resume_scores_path: Path | None = None,
     on_status=None,
+    local_gate_owned: bool = False,
 ) -> list[FrameScore]:
     """Shared implementation behind scan_video_frames (whole file) and
     scan_window_frames (one short padded clip) -- extract via one continuous
@@ -556,8 +557,10 @@ async def _scan_frames(
                     on_extract_progress=extraction_progress,
                     start_offset=effective_start_offset + offset, clip_duration=duration,
                 )
-        if remote_extract_enabled():
-            # A remote scan's local fallback must rejoin audio/blur exclusion.
+        if remote_extract_enabled() and not local_gate_owned:
+            # Output verification already runs under the parent's heavy gate.
+            # Reacquiring it from this child extraction task would deadlock.
+            # An ordinary remote scan's fallback must rejoin exclusion.
             from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
             async with HEAVY_PIPELINE_LOCK:
                 await extract()
@@ -689,13 +692,14 @@ async def _scan_frames(
 async def scan_video_frames(
     video_path: Path, ffmpeg_bin: str, duration_seconds: float,
     frame_interval_seconds: float, on_progress=None, concurrency: int = 1,
-    resume_scores_path: Path | None = None, on_status=None,
+    resume_scores_path: Path | None = None, on_status=None, local_gate_owned: bool = False, start_offset: float = 0.0,
 ) -> list[FrameScore]:
     """Sample the whole title, preserving the contiguous resume prefix."""
     return await _scan_frames(
         video_path, ffmpeg_bin, frame_interval_seconds, duration_seconds,
         on_progress=on_progress, concurrency=concurrency,
-        resume_scores_path=resume_scores_path, on_status=on_status,
+        resume_scores_path=resume_scores_path, on_status=on_status, local_gate_owned=local_gate_owned,
+        start_offset=start_offset, clip_duration=duration_seconds if start_offset else None,
     )
 
 

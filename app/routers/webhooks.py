@@ -94,8 +94,11 @@ async def sonarr_webhook(request: Request):
         client = sonarr_integration.SonarrClient(sonarr_url, sonarr_api_key)
         tags = await _fetch_tags_safe(client.get_series_tag_labels(parsed["series_id"]))
 
-    should_run_audio = trigger_enabled or tags_request_audio(tags)
-    should_run_video = tags_request_video(tags)
+    from app.scenes import protection
+    async with get_session() as preferences:
+        protected = await protection.enabled(preferences)
+    should_run_audio = protected or trigger_enabled or tags_request_audio(tags)
+    should_run_video = protected or tags_request_video(tags)
 
     if should_run_video:
         await scene_job_queue.enqueue_scan_if_not_already_active(title.id)
@@ -157,8 +160,11 @@ async def radarr_webhook(request: Request):
         client = radarr_integration.RadarrClient(radarr_url, radarr_api_key)
         tags = await _fetch_tags_safe(client.get_movie_tag_labels(parsed["movie_id"]))
 
-    should_run_audio = trigger_enabled or tags_request_audio(tags)
-    should_run_video = tags_request_video(tags)
+    from app.scenes import protection
+    async with get_session() as preferences:
+        protected = await protection.enabled(preferences)
+    should_run_audio = protected or trigger_enabled or tags_request_audio(tags)
+    should_run_video = protected or tags_request_video(tags)
 
     if should_run_video:
         await scene_job_queue.enqueue_scan_if_not_already_active(title.id)
@@ -190,8 +196,10 @@ async def radarr_webhook(request: Request):
 @router.post("/bazarr")
 async def bazarr_webhook(request: Request):
     await _check_token(request)
+    from app.scenes import protection
     async with get_session() as session:
-        if not await get_setting(session, "trigger_bazarr_enabled"):
+        protected = await protection.enabled(session)
+        if not protected and not await get_setting(session, "trigger_bazarr_enabled"):
             return {"status": "ignored", "reason": "bazarr trigger disabled in settings"}
 
     parsed = bazarr_integration.parse_subtitle_downloaded_event(dict(request.query_params))
@@ -206,5 +214,13 @@ async def bazarr_webhook(request: Request):
             display_name=video_path.stem,
             video_path=str(video_path),
         )
+        needs_scan = False
+        if protected:
+            try:
+                await protection.readiness(session, title)
+            except protection.ProtectionNotReady:
+                needs_scan = True
+    if needs_scan:
+        await scene_job_queue.enqueue_scan_if_not_already_active(title.id)
     await enqueue_if_not_already_active(title.id, TriggerSource.bazarr)
     return {"status": "queued"}

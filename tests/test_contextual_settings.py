@@ -22,6 +22,8 @@ def test_local_settings_roundtrip_optional_key_old_client_and_import(monkeypatch
     async def session(): yield None
     async def get_setting(session, key): return stored.get(key, DEFAULT_SETTINGS[key])
     async def set_setting(session, key, value): stored[key] = value
+    from app.scenes import protection
+    monkeypatch.setattr(protection, "get_setting", get_setting)
     for module in (settings, setup):
         monkeypatch.setattr(module, "get_session", session)
         monkeypatch.setattr(module, "get_setting", get_setting)

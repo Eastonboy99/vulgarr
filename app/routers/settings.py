@@ -64,6 +64,7 @@ SETTING_KEYS = [
     "scene_blur_pad_start_seconds",
     "scene_blur_pad_end_seconds",
     "scene_auto_process",
+    "scene_protection_enabled",
     "claude_vision_verify_enabled",
     "claude_vision_base_url",
     "claude_vision_api_key",
@@ -177,6 +178,8 @@ async def update_settings(
     scene_content_policy: str = Form(""),
     scene_semantic_enabled: bool = Form(False),
     scene_semantic_window_seconds: float = Form(10.0),
+    scene_protection_present: bool = Form(False),
+    scene_protection_enabled: bool = Form(False),
     scene_contextual_present: bool = Form(False),
     scene_contextual_enabled: bool = Form(False),
     scene_contextual_base_url: str = Form(""),
@@ -206,6 +209,22 @@ async def update_settings(
                 await contextual.local_endpoint(scene_contextual_base_url)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
+    from app.scenes import protection
+    async with get_session() as validation_session:
+        effective_protection = scene_protection_enabled if scene_protection_present else await protection.enabled(validation_session)
+        if effective_protection:
+            if scene_semantic_enabled or not (movie_output_folder.strip() or tv_output_folder.strip()):
+                raise HTTPException(422, "Protection-first mode requires clean output folders and disables legacy semantic analysis")
+            config = ({"scene_contextual_enabled": True, "scene_contextual_base_url": scene_contextual_base_url,
+                "scene_contextual_api_key": scene_contextual_api_key, "scene_contextual_model": scene_contextual_model,
+                "scene_contextual_window_seconds": min(scene_contextual_window_seconds, 4),
+                "scene_contextual_timeout_seconds": scene_contextual_timeout_seconds} if scene_contextual_present
+                else await protection.context_config(validation_session))
+            config["scene_contextual_enabled"] = True
+            try:
+                await contextual.validate_config(config)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
     movie_output_folder = movie_output_folder.strip()
     tv_output_folder = tv_output_folder.strip()
     if any(folder and not Path(folder).is_absolute() for folder in (movie_output_folder, tv_output_folder)):
@@ -299,6 +318,8 @@ async def update_settings(
         await set_setting(session, "scene_blur_pad_start_seconds", max(0.0, scene_blur_pad_start_seconds))
         await set_setting(session, "scene_blur_pad_end_seconds", max(0.0, scene_blur_pad_end_seconds))
         await set_setting(session, "scene_auto_process", scene_auto_process)
+        if scene_protection_present:
+            await set_setting(session, "scene_protection_enabled", scene_protection_enabled)
         if policy is not None:
             await set_setting(session, "scene_content_policy", policy)
         if scene_contextual_present:

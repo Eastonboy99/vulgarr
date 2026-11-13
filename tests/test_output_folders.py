@@ -242,6 +242,15 @@ def test_final_mux_uses_cached_audio_and_original_metadata(monkeypatch, tmp_path
     assert [final[i+1] for i, item in enumerate(final) if item == '-i'][1] == str(tmp_path/'original.mkv')
 
 
+@pytest.fixture(autouse=True)
+def legacy_output_mode(monkeypatch):
+    # These unit fakes do not implement the settings ORM. Protection-first has
+    # separate real-database tests; these retain their original opt-out contract.
+    from app.scenes import protection
+    async def disabled(session): return False
+    monkeypatch.setattr(protection, 'enabled', disabled)
+
+
 class FakeSession:
     def __init__(self, approved=None):
         self.approved = approved

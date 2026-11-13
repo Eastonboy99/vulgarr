@@ -136,11 +136,12 @@ def observations_to_evidence(raw, model):
     # as an AI flag, and every contextual candidate requires human approval.
     return validate_evidence({"schema_version": 1, "coverage": sorted(CONTEXTUAL_CATEGORIES),
         "labels": {"nudity.contextual": 1.0} if states & POSITIVE else {},
-        "uncertain": bool(states & AMBIGUOUS), "model": model,
+        "uncertain": bool(states & AMBIGUOUS), "model": model, "observations": frames,
         "explanation": "Local AI samples: " + "; ".join(r["frame_id"] + " " + r["state"] + ": " + r["evidence"] for r in frames)[:975]})
 
 
-async def classify_window(*, base_url, api_key, model, ffmpeg_bin, video_path, start, end, timeout_seconds=300):
+async def classify_window(*, base_url, api_key, model, ffmpeg_bin, video_path, start, end, timeout_seconds=300,
+                          max_long_edge=768, purpose="discovery"):
     """Strict response validation; any failure is non-publishable, not 'safe'."""
     try:
         if not isinstance(model, str) or not model.strip() or len(model) > 1000:
@@ -151,11 +152,15 @@ async def classify_window(*, base_url, api_key, model, ffmpeg_bin, video_path, s
         target, headers, extensions = await local_endpoint(base_url)
         if api_key:
             headers["Authorization"] = "Bearer " + api_key
-        content = [{"type": "text", "text": PROMPT}]
+        if max_long_edge not in (768, 1024) or purpose not in ("discovery", "recheck", "output"):
+            raise ValueError()
+        instruction = (" Recheck visible clothing and coverage carefully; preserve uncertainty if unresolved." if purpose == "recheck" else
+            " These are rendered frames. Judge only content still visibly discernible, not nudity inferred behind obscuring blur." if purpose == "output" else "")
+        content = [{"type": "text", "text": PROMPT + instruction}]
         with tempfile.TemporaryDirectory(prefix="vulgarr-contextual-") as folder:
             for i, fraction in enumerate(FRACTIONS):
                 path = Path(folder) / f"{i}.jpg"
-                await asyncio.to_thread(extract_frame, ffmpeg_bin, Path(video_path), start + (end - start) * fraction, path, max_long_edge=768)
+                await asyncio.to_thread(extract_frame, ffmpeg_bin, Path(video_path), start + (end - start) * fraction, path, max_long_edge=max_long_edge)
                 content.extend([{"type": "text", "text": f"frame_id=f{i}"},
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")}}])
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=10), trust_env=False, follow_redirects=False) as client:
@@ -188,17 +193,26 @@ async def classify_window(*, base_url, api_key, model, ffmpeg_bin, video_path, s
 
 
 async def scan_contextual_windows(*, video_path, duration, checkpoint_dir, fingerprint, base_url,
-                                  api_key, model, ffmpeg_bin, window_seconds=8, timeout_seconds=300, on_progress=None):
+                                  api_key, model, ffmpeg_bin, window_seconds=8, timeout_seconds=300, on_progress=None,
+                                  extra_windows=(), window_plan=None, max_long_edge=768, purpose="discovery"):
     validate_sampling(window_seconds, timeout_seconds)
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("Contextual scan requires a positive finite duration")
     # Validate privacy even when every window is available in a checkpoint.
     await local_endpoint(base_url)
+    plan = ([(i * window_seconds, min(duration, (i + 1) * window_seconds))
+        for i in range(math.ceil(duration / window_seconds))] + list(extra_windows)
+        if window_plan is None else list(window_plan))
+    plan = sorted(set(tuple(w) for w in plan))
+    if any(len(w) != 2 or not all(type(t) in (int, float) and math.isfinite(t) for t in w)
+           or not 0 <= w[0] < w[1] <= duration for w in plan):
+        raise ValueError("Invalid contextual sampling plan")
     identity = config_fingerprint({"source": fingerprint, "endpoint": base_url, "model": model,
+        "plan": plan, "long_edge": max_long_edge, "purpose": purpose,
         "window": window_seconds, "timeout": timeout_seconds, "credential_hash": hashlib.sha256(api_key.encode()).hexdigest()})
     path = Path(checkpoint_dir) / (VERSION + ".jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
-    total = math.ceil(duration / window_seconds)
+    total = len(plan)
     prefix = []
     if path.exists():
         for line in path.read_text().splitlines():
@@ -218,10 +232,11 @@ async def scan_contextual_windows(*, video_path, duration, checkpoint_dir, finge
             handle.write(json.dumps({"identity": identity, "index": i, "evidence": evidence}) + "\n")
     results = []
     for i in range(total):
-        start, end = i * window_seconds, min(duration, (i + 1) * window_seconds)
+        start, end = plan[i]
         try:
             evidence = prefix[i] if i < len(prefix) else await classify_window(base_url=base_url, api_key=api_key,
-                model=model, ffmpeg_bin=ffmpeg_bin, video_path=video_path, start=start, end=end, timeout_seconds=timeout_seconds)
+                model=model, ffmpeg_bin=ffmpeg_bin, video_path=video_path, start=start, end=end, timeout_seconds=timeout_seconds,
+                **({"max_long_edge": max_long_edge, "purpose": purpose} if max_long_edge != 768 or purpose != "discovery" else {}))
         except ContextualAnalysisError as exc:
             raise ContextualAnalysisError(f"Window {i + 1}/{total} ({start:.2f}–{end:.2f}s): {exc}") from None
         if i >= len(prefix):

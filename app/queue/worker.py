@@ -527,6 +527,9 @@ class JobQueue:
                     from functools import partial
                     from app.output import source_fingerprint, title_edit_destination
                     destination = await title_edit_destination(session, title, app_settings.media_root)
+                    from app.scenes import protection
+                    if await protection.enabled(session) and destination is None:
+                        raise ProcessingError("Protection-first mode requires a configured clean output folder for this title; original retained")
                     source_clean_indices = parse_index_list(
                         title.source_clean_track_audio_indices if title.clean_audio_path
                         else title.clean_track_audio_indices)

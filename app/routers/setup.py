@@ -64,9 +64,19 @@ async def import_config(request: Request):
             window = filtered["scene_semantic_window_seconds"]
             if type(window) not in (int, float) or not 1 <= window <= 30:
                 raise ValueError("Semantic window must be between 1 and 30 seconds")
-        if set(filtered) & set(contextual.KEYS):
+        from app.scenes import protection
+        if "scene_protection_enabled" in filtered and type(filtered["scene_protection_enabled"]) is not bool:
+            raise ValueError("Protection-first opt-in must be Boolean")
+        if set(filtered) & (set(contextual.KEYS) | set(protection.KEYS) | {"scene_semantic_enabled", "movie_output_folder", "tv_output_folder"}):
             async with get_session() as session:
                 config = {key: filtered.get(key, await get_setting(session, key)) for key in contextual.KEYS}
+                protected = filtered.get("scene_protection_enabled", await protection.enabled(session))
+                if protected:
+                    semantic = filtered.get("scene_semantic_enabled", await get_setting(session, "scene_semantic_enabled"))
+                    folders = [filtered.get(k, await get_setting(session, k)) for k in ("movie_output_folder", "tv_output_folder")]
+                    if semantic or not any(isinstance(f, str) and f.strip() for f in folders):
+                        raise ValueError("Protection-first mode requires clean output folders and no legacy semantic analysis")
+                    config["scene_contextual_enabled"] = True
             await contextual.validate_config(config)
     except (ValueError, TypeError):
         return JSONResponse({"ok": False, "error": "Invalid or unsupported content policy settings"}, status_code=400)

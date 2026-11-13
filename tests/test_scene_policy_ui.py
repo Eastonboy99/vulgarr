@@ -22,6 +22,8 @@ def test_policy_settings_roundtrip_export_import_and_validation(monkeypatch):
         return stored.get(key, DEFAULT_SETTINGS.get(key))
     async def set_setting(_session, key, value):
         stored[key] = value
+    from app.scenes import protection
+    monkeypatch.setattr(protection, "get_setting", get_setting)
     for module in (settings, setup):
         monkeypatch.setattr(module, "get_session", session)
         monkeypatch.setattr(module, "set_setting", set_setting)
