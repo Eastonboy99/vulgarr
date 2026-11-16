@@ -150,7 +150,7 @@ def extract_frame(
     auto-downscale; sending it pre-shrunk to ~512px costs closer to ~200).
     Left unset (None) for the thumbnail/review-UI callers, which want full
     quality for a human to actually look at."""
-    cmd = [ffmpeg_bin, "-nostdin", "-loglevel", "error", "-ss", f"{timestamp:.3f}", "-i", str(video_path)]
+    cmd = [ffmpeg_bin, "-nostdin", "-loglevel", "error", "-ss", f"{timestamp:.6f}", "-i", str(video_path)]
     if max_long_edge is not None:
         cmd += ["-vf", f"scale='min({max_long_edge},iw)':'min({max_long_edge},ih)':force_original_aspect_ratio=decrease"]
     cmd += ["-frames:v", "1", "-q:v", "4", str(out_path)]

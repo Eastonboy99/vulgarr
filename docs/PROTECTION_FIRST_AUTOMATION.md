@@ -69,6 +69,21 @@ compare stream types, audio sample rates/channel counts, and relative playback
 stream starts when timestamps are available (250ms tolerance). Long blur windows
 also get an end-boundary decode check.
 
+Visual sampling and completeness use the **verified video packet endpoint**, not
+container duration (which may extend beyond the picture because of audio or mux
+rounding). A timeout-bounded tail packet probe reads to EOF; track duration tags
+are only seek hints, not proof that later video is absent. Both source analysis
+and rendered-output verification use this visual horizon. Unknown timing, including
+unsupported video starts delayed over 250ms from the container origin, fails closed.
+This does **not** shorten the rendered movie or crop its audio tracks. Terminal
+blocking intervals still extend through the full presentation tail so a blur+mute
+decision does not accidentally leave trailing audio unmuted.
+
+Final partial contextual/shot windows clamp seek requests just before the last
+video frame's PTS, avoiding empty JPEGs while that frame is still displayed.
+Backend-requested sample timestamps are retained in evidence; repeated clamped
+samples are not independent confidence votes.
+
 Then independently scan the **rendered** video with NudeNet and the local VLM:
 
 - Anatomy samples are offset by half the source sampling cadence.
@@ -76,8 +91,9 @@ Then independently scan the **rendered** video with NudeNet and the local VLM:
   (which would accidentally repeat the original timestamps).
 - Include shot-start windows. Missing/incomplete evidence or failed requests are
   errors, never negative classifications.
-- Expected uncertain/obscured frames wholly inside known blur coverage are not
-  mistaken for unhandled exposure. Discernible positive content is still a
+- Expected uncertain/obscured observations are ignored only if the entire sample
+  window and its seek points are inside known blur coverage, not just isolated
+  timestamps near a blur edge. Discernible positive content is still a
   failure, including inside an existing blur window.
 - A residual blocked interval adds auditable automatic correction coverage.
   Already-covered residual content strengthens blur without duplicate rows.
@@ -117,13 +133,32 @@ take many hours; do not assume real-time processing or qualified GPU throughput.
 
 Implementation regression qualification:
 
-- Standard suite: **581 passed, 12 skipped**.
-- Both diagnostic media workers: **605 passed**.
+- Standard suite: **610 passed, 13 skipped**.
+- Both diagnostic media workers: **636 passed**.
 - Offline Chrome at **1100px and 390px**: no control overlap, overflow or script
   errors; all 18 NudeNet controls remain independent of contextual policy.
 - Real local FFmpeg test: a one-second synthetic clip's half-second shot change
   produces the expected short-shot window.
 - These are software/media-integrity checks, **not broad model-accuracy proof**.
+
+### Video/container endpoint regression
+
+Title 3807's failed scan had 29,820 unique, contiguous 250ms anatomy samples,
+no missing raw detections and no malformed checkpoint lines. The last sample was
+7,454.750s. The container duration was 7,455.144s, but an independent tail-packet
+probe verified the picture ended at 7,455.030s (track tag: 7,455.031s). Comparing
+against the container incorrectly failed a 0.394s gap at a 0.3775s tolerance;
+the true visual tail gap is 0.280s.
+
+The corrected check passed against the saved checkpoint in an isolated read-only
+NAS process. Removing one interior sample from an in-memory copy still failed
+coverage. No models, scan jobs, publication, configuration changes or service
+restarts were involved. Detailed failure messages now distinguish missing raw
+records, insufficient counts, internal gaps and missing video tails.
+
+Opt-in synthetic tests on both FFmpeg workers reproduce audio/mux overhang and
+prove that seeking past the final frame PTS yields no JPEG while the safe seek
+returns the final frame. These are not movie-wide accuracy qualification.
 
 ### Opt-in annotated benchmark
 

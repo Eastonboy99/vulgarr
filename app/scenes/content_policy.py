@@ -111,7 +111,7 @@ def validate_evidence(value: dict) -> dict:
     recall between sampled frames. Missing labels within coverage mean absent.
     """
     required = {"schema_version", "labels", "coverage", "uncertain", "explanation", "model"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold", "observations"}:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold", "observations", "sample_timestamps"}:
         raise ValueError("Invalid evidence fields")
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise ValueError("Unsupported evidence schema")
@@ -126,6 +126,12 @@ def validate_evidence(value: dict) -> dict:
         if (set(value["coverage"]) != NUDENET_CATEGORIES or type(threshold) not in (int, float)
                 or not math.isfinite(threshold) or not 0 <= threshold <= 1):
             raise ValueError("Invalid detector confidence threshold")
+    if "sample_timestamps" in value:
+        times = value["sample_timestamps"]
+        if (set(value["coverage"]) != CONTEXTUAL_CATEGORIES or not isinstance(times, list) or len(times) != 4
+                or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
+                or times != sorted(times)):
+            raise ValueError("Invalid backend sample timestamps")
     if "observations" in value:
         observations = value["observations"]
         states = {"exposed_nudity", "contextual_nudity", "towel_sheet_covered", "swimwear_underwear", "clothed", "ambiguous_bare_skin", "no_people", "uncertain"}

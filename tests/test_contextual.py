@@ -87,9 +87,10 @@ def test_mixed_private_public_dns_rejected(monkeypatch):
     with pytest.raises(ValueError): asyncio.run(c.local_endpoint("http://desktop/v1"))
 
 
+@pytest.mark.parametrize("capped", [False, True])
 @pytest.mark.parametrize("status,finish,valid", [(200, "stop", True), (302, "stop", False), (200, "length", False), (500, "stop", False),
     (200, "content_filter", False), (200, "bad_json", False), (200, "bad_observations", False)])
-def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch, private_dns, status, finish, valid):
+def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch, private_dns, status, finish, valid, capped):
     calls, times, constructors = [], [], []
     def extract(binary, video, timestamp, target, **options):
         times.append(timestamp)
@@ -109,8 +110,12 @@ def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch,
     monkeypatch.setattr(c, "extract_frame", extract)
     monkeypatch.setattr(c.httpx, "AsyncClient", Client)
     args = dict(base_url="http://desktop:1234/v1", api_key="", model="mock", ffmpeg_bin="ffmpeg", video_path=tmp_path/"source", start=0, end=8)
+    if capped:
+        args.update(start=8,end=8.02,frame_timestamp_limit=7.98)
     if valid:
-        assert asyncio.run(c.classify_window(**args))["labels"] == {"nudity.contextual": 1.0}
+        result = asyncio.run(c.classify_window(**args))
+        assert result["labels"] == {"nudity.contextual": 1.0}
+        assert result["sample_timestamps"] == ([7.98]*4 if capped else [1,3,5,7])
     else:
         with pytest.raises(ValueError) as err: asyncio.run(c.classify_window(**args))
         assert "desktop" not in str(err.value)
@@ -118,7 +123,7 @@ def test_request_is_local_strict_and_failures_do_not_leak(tmp_path, monkeypatch,
         if finish == "bad_json": assert "malformed or incomplete JSON" in str(err.value)
         if finish == "bad_observations": assert "invalid structured observations" in str(err.value)
         if status != 200: assert f"HTTP {status}" in str(err.value)
-    assert times == [1, 3, 5, 7]
+    assert times == ([7.98]*4 if capped else [1,3,5,7])
     assert constructors[0]["trust_env"] is False
     assert constructors[0]["follow_redirects"] is False
     assert "Authorization" not in calls[0][1]["headers"]
@@ -150,7 +155,7 @@ def test_resume_only_contiguous_prefix_and_configuration_identity(tmp_path, monk
     assert [(a, b) for a, b, _ in results] == [(0, 8), (8, 16), (16, 20)]
     saved = (tmp_path/(c.VERSION+".jsonl")).read_text()
     assert "private-secret" not in saved and "http://desktop" not in saved
-    for change in ({"fingerprint": "source-v2"}, {"model": "other"}, {"window_seconds": 10}):
+    for change in ({"fingerprint": "source-v2"}, {"model": "other"}, {"window_seconds": 10}, {"frame_timestamp_limit": 19.8}):
         calls.clear()
         asyncio.run(c.scan_contextual_windows(**{**args, **change}))
         assert calls[0] == 0

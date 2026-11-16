@@ -17,8 +17,9 @@ from app.db.session import get_setting
 from app.output import source_fingerprint
 from app.scenes.content_policy import Action, resolve_action, policy_fingerprint, validate_policy
 from app.vision import contextual
+from app.vision.timeline import probe_visual_timeline
 
-VERSION = "protection-v1"
+VERSION = "protection-v2"
 CONTEXT_WINDOW = 4.0
 DETECTOR_INTERVAL = .25
 BOUNDARY_SECONDS = 2.0
@@ -67,13 +68,39 @@ def blocked(evidence, policy):
 
 
 def validate_detector_coverage(scores, duration, interval):
-    times = sorted({float(s.timestamp) for s in scores})
-    if (not scores or any(s.detections is None for s in scores)
-            or len(times) < max(1, round(duration / interval) - 1)
-            or any(not math.isfinite(t) or t < 0 or t > duration for t in times)
-            or times[0] > interval or duration - times[-1] > interval * 1.51
-            or any(b - a > interval * 1.51 for a,b in zip(times, times[1:]))):
-        raise ProtectionNotReady("Anatomy analysis returned incomplete full-title evidence; previous edit retained")
+    if not math.isfinite(duration) or duration <= 0 or not math.isfinite(interval) or interval <= 0:
+        raise ProtectionNotReady("Invalid visual coverage horizon; previous edit retained")
+    numeric, invalid = [], 0
+    for score in scores:
+        try:
+            t = float(score.timestamp)
+        except (TypeError, ValueError):
+            invalid += 1
+            continue
+        if not math.isfinite(t) or not 0 <= t <= duration:
+            invalid += 1
+        else:
+            numeric.append(t)
+    times = sorted(set(numeric))
+    reasons = []
+    if not scores: reasons.append("no classified samples")
+    missing = sum(s.detections is None for s in scores)
+    if missing: reasons.append(f"{missing}/{len(scores)} samples lack raw detections")
+    if invalid: reasons.append(f"{invalid} invalid sample timestamps")
+    expected = max(1, round(duration / interval))
+    if len(times) < max(1, expected - 1):
+        reasons.append(f"{len(times)} unique samples; expected about {expected}")
+    if times:
+        if times[0] > interval:
+            reasons.append(f"first sample is late at {times[0]:.3f}s")
+        if duration-times[-1] > interval*1.51:
+            reasons.append(f"tail gap {duration-times[-1]:.3f}s: last sample {times[-1]:.3f}s, visual end {duration:.3f}s")
+        gaps = [(a,b) for a,b in zip(times,times[1:]) if b-a > interval*1.51]
+        if gaps:
+            a,b = gaps[0]
+            reasons.append(f"{len(gaps)} timestamp gaps; first {a:.3f}–{b:.3f}s")
+    if reasons:
+        raise ProtectionNotReady("Anatomy analysis incomplete: " + "; ".join(reasons) + "; previous edit retained")
 
 
 async def shot_windows(video_path, duration, ffmpeg_bin, *, local_gate_owned=False):
@@ -100,12 +127,13 @@ async def shot_windows(video_path, duration, ffmpeg_bin, *, local_gate_owned=Fal
 
 
 async def analyze_windows(*, video_path, duration, checkpoint_dir, fingerprint, config,
-                          policy, on_progress=None):
+                          policy, on_progress=None, frame_timestamp_limit=None):
     shots = await shot_windows(video_path, duration, app_settings.ffmpeg_bin)
     common = dict(video_path=video_path, duration=duration, fingerprint=fingerprint,
         base_url=config["scene_contextual_base_url"], api_key=config["scene_contextual_api_key"],
         model=config["scene_contextual_model"], ffmpeg_bin=app_settings.ffmpeg_bin,
-        window_seconds=config["scene_contextual_window_seconds"], timeout_seconds=config["scene_contextual_timeout_seconds"])
+        window_seconds=config["scene_contextual_window_seconds"], timeout_seconds=config["scene_contextual_timeout_seconds"],
+        frame_timestamp_limit=frame_timestamp_limit)
     async def discovery_progress(done,total):
         if on_progress and total: await on_progress(.6*done/total,1)
     windows = await contextual.scan_contextual_windows(**common, checkpoint_dir=checkpoint_dir/"discovery",
@@ -177,8 +205,23 @@ async def audio_ready(session, title):
         and title.clean_audio_source_fingerprint == source_fingerprint(Path(title.video_path)))
 
 
+def _interval_covered(start, end, intervals):
+    cursor = start
+    for left,right in sorted(intervals):
+        if right < cursor:
+            continue
+        if left > cursor:
+            return False
+        if right >= end:
+            return True
+        cursor = right
+    return False
+
+
 async def output_findings(*, session, title, path, work_dir, policy, duration, ignored=(), covered=(), on_progress=None):
     """Offset full-title output samples plus shot starts; never trust input flags alone."""
+    timeline = await probe_visual_timeline(app_settings.ffprobe_bin, path)
+    duration = timeline.video_end
     config = await context_config(session)
     step = config["scene_contextual_window_seconds"]
     # Different timestamps from source discovery. Explicitly include both edges.
@@ -214,16 +257,20 @@ async def output_findings(*, session, title, path, work_dir, policy, duration, i
         checkpoint_dir=work_dir, fingerprint=source_fingerprint(path), window_plan=plan,
         base_url=config["scene_contextual_base_url"], api_key=config["scene_contextual_api_key"],
         model=config["scene_contextual_model"], ffmpeg_bin=app_settings.ffmpeg_bin,
-        window_seconds=step, timeout_seconds=config["scene_contextual_timeout_seconds"], purpose="output", on_progress=vision_progress)
+        window_seconds=step, timeout_seconds=config["scene_contextual_timeout_seconds"], purpose="output", on_progress=vision_progress,
+        frame_timestamp_limit=timeline.last_sample_time)
     for a,b,e in windows:
         if not blocked(e, policy):
             continue
-        unknown_times = [a + (b-a)*contextual.FRACTIONS[int(r["frame_id"][1])]
+        times = e.get("sample_timestamps", contextual.sample_timestamps(a,b,timeline.last_sample_time))
+        unknown_times = [times[int(r["frame_id"][1])]
             for r in e.get("observations", []) if r["state"] in contextual.AMBIGUOUS]
         # Expected obscuration is not a new failure. Positive discernible content
         # remains a failure even inside an existing blur window.
-        if (not e["labels"] and unknown_times
-                and all(any(left <= t <= right for left,right in covered) for t in unknown_times)):
+        # Forward seeking is frame-quantized; a requested point just inside a
+        # blur boundary does not prove the decoded image was inside it too.
+        if (not e["labels"] and unknown_times and _interval_covered(a,b,covered)
+                and all(_interval_covered(t,t,covered) for t in unknown_times)):
             continue
         findings.append((a,b,e))
     # Honor explicit human exceptions, splitting rather than broad overlap vetoes.

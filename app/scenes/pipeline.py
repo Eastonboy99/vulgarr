@@ -225,6 +225,10 @@ async def _scan_for_scenes(
     video_path = Path(title.video_path)
     src_probe = await probe(app_settings.ffprobe_bin, video_path)
     duration = float(src_probe["format"].get("duration", 0))
+    visual_timeline = None
+    if protected:
+        visual_timeline = await protection.probe_visual_timeline(app_settings.ffprobe_bin, video_path, src_probe)
+        duration = visual_timeline.video_end
 
     scan_work_dir = app_settings.data_dir / "scan_work" / str(job_id)
     scan_work_dir.mkdir(parents=True, exist_ok=True)
@@ -341,11 +345,12 @@ async def _scan_for_scenes(
     if selected != sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow"):
         raise ValueError("Detection label preferences changed during scanning; run a fresh scan")
     contextual_analysis = await _add_contextual_rows(session, title, job_id, staged_rows, scan_work_dir,
-        fingerprint, duration, contextual_config, on_progress, on_stage)
+        fingerprint, duration, contextual_config, on_progress, on_stage, visual_timeline=visual_timeline)
     contextual_analysis.pop("added_rows")
     if protected:
         contextual_analysis["protection"] = {"fingerprint": protection_revision,
-            "source": protection_source, "generation": job_id, "complete": True}
+            "source": protection_source, "generation": job_id, "complete": True,
+            "visual_end_seconds": duration, "container_duration_seconds": visual_timeline.container_duration}
     auto_approved_count = sum(r.status == SceneReviewStatus.approved for r in staged_rows)
     need_review_count = sum(r.status == SceneReviewStatus.pending for r in staged_rows)
     await _activate_scan(session, title.id, job_id, staged_rows, analysis={
@@ -381,7 +386,7 @@ async def _contextual_config(session):
 
 
 async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerprint,
-                               duration, config, on_progress, on_stage):
+                               duration, config, on_progress, on_stage, visual_timeline=None):
     """Stage independent proposals without publishing or vetoing NudeNet rows.
 
     Adjacent equivalent windows coalesce. Subtract already-blocking detector
@@ -401,7 +406,8 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
             await on_stage("Protection-first discovery, shot checks and conservative local rechecks")
         windows, coverage = await protection.analyze_windows(video_path=Path(title.video_path), duration=duration,
             checkpoint_dir=work_dir / "protection", fingerprint=fingerprint, config=config,
-            policy=await get_setting(session, "scene_content_policy"), on_progress=_progress_slice(on_progress, .35, .99))
+            policy=await get_setting(session, "scene_content_policy"), on_progress=_progress_slice(on_progress, .35, .99),
+            frame_timestamp_limit=visual_timeline.last_sample_time if visual_timeline else None)
         analysis["protection_coverage"] = coverage
     else:
         windows = await contextual.scan_contextual_windows(video_path=Path(title.video_path), duration=duration,
@@ -426,6 +432,11 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
             groups.append([start, end, dict(evidence), 1, [{"start": start, "end": end, "evidence": evidence}]])
     added = 0
     for start, end, evidence, count, observations in groups:
+        # Visual assurance ends with the picture, but a terminal blur+mute
+        # decision must still cover trailing audio/mux time. Never crop audio
+        # simply because it outlasts the last video packet.
+        if protected and visual_timeline and end >= duration-1e-6:
+            end = max(end, visual_timeline.container_duration)
         segments = [(start, end)]
         from app.scenes.content_policy import resolve_action
         requested_action = resolve_action(policy, evidence, conservative=protected).action

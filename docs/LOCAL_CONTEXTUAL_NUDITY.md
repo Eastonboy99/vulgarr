@@ -142,8 +142,8 @@ new settings. Coverage/config changes are surfaced as requiring a fresh scan.
 
 ## Qualification
 
-- `python -m pytest tests/ -q`: **581 passed, 12 skipped**, 17 dependency warnings.
-- With both local diagnostic render containers enabled: **605 passed**, 17 warnings.
+- `python -m pytest tests/ -q`: **610 passed, 13 skipped**, 17 dependency warnings.
+- With both local diagnostic render containers enabled: **636 passed**, 17 warnings.
 - Chrome offline checks at **1,100px** and a real emulated **390px** viewport:
   no horizontal overflow or overlapping discovery controls; no JavaScript errors;
   all 18 NudeNet controls remain present. Changing the contextual action updates

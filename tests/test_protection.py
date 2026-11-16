@@ -133,6 +133,7 @@ def test_source_rechecks_do_not_veto_positives_and_expand_boundaries(tmp_path,mo
 
 @pytest.mark.parametrize("state,covered,ignored,count", [
     ("uncertain",[(0,4)],[],0),("uncertain",[],[],1),
+    ("uncertain",[(0,3.6)],[],1),("uncertain",[(0,2),(2,4)],[],0),
     ("contextual_nudity",[(0,4)],[],1),("contextual_nudity",[],[(1,3)],2),
     ("clothed",[],[],0)])
 def test_output_checks_distinguish_expected_blur_from_residual_content(tmp_path,monkeypatch,state,covered,ignored,count):
@@ -147,6 +148,10 @@ def test_output_checks_distinguish_expected_blur_from_residual_content(tmp_path,
                 assert kwargs["purpose"]=="output"
                 assert (0.,.5) in kwargs["window_plan"] and (.5,4.5) in kwargs["window_plan"]
                 return [(0,4,evidence(state))]
+            async def timeline(*args):
+                from app.vision.timeline import VisualTimeline
+                return VisualTimeline(8,8,7.9375)
+            monkeypatch.setattr(protection,"probe_visual_timeline",timeline)
             monkeypatch.setattr(protection,"shot_windows",shots)
             monkeypatch.setattr(classifier,"scan_video_frames",scores)
             monkeypatch.setattr(contextual,"scan_contextual_windows",scan)
@@ -231,18 +236,23 @@ def test_whole_title_auto_approval_and_configuration_fencing(tmp_path,monkeypatc
         async with database(tmp_path) as (session,title,_):
             job=await session.get(SceneJob,1);job.state=JobState.processing;await session.commit()
             async def local(*args):return None
-            async def probe(*args):return {"format":{"duration":"8"}}
+            async def probe(*args):return {"format":{"duration":"8.144"}}
             async def scores(*args,**kwargs):
-                assert kwargs["frame_interval_seconds"]==.25
+                assert kwargs["frame_interval_seconds"]==.25 and kwargs['duration_seconds']==8
                 return [SimpleNamespace(timestamp=i*.25,confidence=0,detections=[]) for i in range(32)]
             async def analyze(**kwargs):
                 assert kwargs["config"]["scene_contextual_window_seconds"]==4
+                assert kwargs['duration']==8 and kwargs['frame_timestamp_limit']==7.9375
                 if changed:await set_setting(session,"scene_contextual_model","changed")
                 return [(0,4,evidence()),(4,8,evidence("uncertain"))],{"complete":True}
             monkeypatch.setattr(contextual,"local_endpoint",local)
             monkeypatch.setattr(pipeline,"probe",probe)
             monkeypatch.setattr(pipeline,"scan_video_frames",scores)
             monkeypatch.setattr(protection,"analyze_windows",analyze)
+            async def timeline(*args):
+                from app.vision.timeline import VisualTimeline
+                return VisualTimeline(8.144,8,7.9375)
+            monkeypatch.setattr(protection,"probe_visual_timeline",timeline)
             monkeypatch.setattr(pipeline,"app_settings",SimpleNamespace(data_dir=tmp_path,ffmpeg_bin="ffmpeg",ffprobe_bin="ffprobe"))
             if changed:
                 with pytest.raises(ValueError):await pipeline.scan_for_scenes(session,title,1)
@@ -252,8 +262,11 @@ def test_whole_title_auto_approval_and_configuration_fencing(tmp_path,monkeypatc
                 assert outcome.auto_approved_count==2 and outcome.need_review_count==0
                 rows=(await session.execute(select(DetectedScene))).scalars().all()
                 assert all(r.status==SceneReviewStatus.approved for r in rows)
+                assert max(r.end_seconds for r in rows)==8.144  # Preserve terminal audio muting.
                 assert all(scene_decision(r,DEFAULT_POLICY).action!=Action.allow for r in rows)
-                assert json.loads(title.scene_analysis)["protection"]["complete"]
+                audit=json.loads(title.scene_analysis)['protection']
+                assert audit['complete']
+                assert audit['visual_end_seconds']==8 and audit['container_duration_seconds']==8.144
                 await protection.readiness(session,title)
                 from app.routers.scenes import _scene_review_context
                 view=await _scene_review_context(session,1)
