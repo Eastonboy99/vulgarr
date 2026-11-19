@@ -311,6 +311,7 @@ async def test_client_batches_preserve_frames_and_bound_requests(monkeypatch, tm
             (args[3] / f'frame_{i+1:08d}.jpg').write_bytes(b'jpeg')
     async def handle(request):
         nonlocal active, peak
+        if request.url.path=='/health':return httpx.Response(200,json={'readiness':'ready'})
         assert request.url.path == '/detect-batch'
         count = request.content.count(b'name="frames"')
         sizes.append(count)
@@ -325,16 +326,18 @@ async def test_client_batches_preserve_frames_and_bound_requests(monkeypatch, tm
         scores = await classifier.scan_video_frames(tmp_path/'video', 'ffmpeg', 25, 1,
                                                     concurrency=2, resume_scores_path=tmp_path/'scores')
     assert sorted(sizes) == [1, 12, 12]
-    assert peak == 2
+    assert peak == 1  # One in-flight classifier request per worker, even on legacy workers.
     assert sorted(s.timestamp for s in scores) == list(range(25))
 
 
 @run_async
 async def test_remote_chunks_overlap_but_checkpoint_in_source_order(monkeypatch, tmp_path):
     configure_remote(monkeypatch)
+    monkeypatch.setenv('SPF_CLASSIFIER_URLS','http://worker-a,http://worker-b')
     monkeypatch.setattr(classifier, '_SCAN_CHUNK_SECONDS', 2)
     second_started = asyncio.Event()
     async def handle(request):
+        if request.url.path=='/health':return httpx.Response(200,json={'readiness':'ready'})
         start = json.loads(request.content)['start']
         if start == 2:
             second_started.set()

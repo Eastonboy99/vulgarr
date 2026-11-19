@@ -7,7 +7,6 @@ scans for scenes pays zero import/model-load cost for this being available.
 """
 
 import asyncio
-import itertools
 import json
 import logging
 import math
@@ -23,6 +22,8 @@ from pathlib import Path
 import httpx
 
 from app.vision.scene_cluster import FrameScore
+from app.vision.worker_pool import WorkerPool, WorkerBudgetExceeded, WorkersUnavailable, SourceScanUnavailable, budget, scan_budget
+from functools import wraps
 from app.vision.remote_source import remote_extract_enabled, source_url
 
 logger = logging.getLogger(__name__)
@@ -31,8 +32,8 @@ logger = logging.getLogger(__name__)
 # SPF_CLASSIFIER_URLS: comma-separated http://host:port list of remote NudeNet
 # workers (see downloadstation/vulgarr-worker). When set, every frame is sent
 # over HTTP for GPU inference instead of running locally on CPU; on any remote
-# failure (worker down, timeout, bad response) we transparently fall back to
-# the original local CPU path so a powered-off desktop never breaks a scan.
+# failure we quarantine that worker, try healthy capacity, then permit only
+# bounded local CPU fallback. Exhaustion withholds the new scene generation.
 # Frames are distributed round-robin across the listed URLs (e.g. one worker
 # per GPU on the same desktop).
 
@@ -60,7 +61,6 @@ def detection_labels(labels):
     finally:
         _selected_detection_labels.reset(token)
 
-_remote_rr = itertools.count()
 _remote_client: httpx.AsyncClient | None = None
 _remote_client_lock = threading.Lock()
 
@@ -69,8 +69,53 @@ def _remote_http_client() -> httpx.AsyncClient:
     global _remote_client
     with _remote_client_lock:
         if _remote_client is None:
-            _remote_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+            _remote_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0), trust_env=False, follow_redirects=False)
         return _remote_client
+
+
+_pool_client = None
+_worker_pool = None
+_ready_workers = set()
+
+
+def _pool():
+    global _pool_client, _worker_pool, _ready_workers
+    client = _remote_http_client()
+    if client is not _pool_client:
+        _pool_client, _worker_pool, _ready_workers = client, WorkerPool(), set()
+    return _worker_pool
+
+
+async def _remote_request(path, validate, **kwargs):
+    client = _remote_http_client()
+    pool = _pool()
+    async def operation(url):
+        if url not in _ready_workers and hasattr(client, 'get'):
+            response = await client.get(url+'/health', timeout=5)
+            if response.status_code not in (404,405):response.raise_for_status()
+            state = response.json().get('readiness') if response.status_code==200 else None
+            if state == 'quarantined':
+                raise WorkersUnavailable('Worker inference quarantined')
+            if state == 'uninitialized':
+                response = await client.post(url+'/ready', timeout=30)
+                response.raise_for_status()
+                if response.json().get('inference_ready') is not True:
+                    raise WorkersUnavailable('Worker smoke inference failed')
+            _ready_workers.add(url)
+        response = await client.post(url+path, **kwargs)
+        if path=='/scan' and response.status_code!=200 and response.headers.get('X-Worker-Failure')=='source':
+            raise SourceScanUnavailable('Source extraction unavailable for this scan')
+        response.raise_for_status()
+        return validate(response.json())
+    return await pool.request(_classifier_urls(), operation, source=path=='/scan')
+
+
+def bounded_scan(function):
+    @wraps(function)
+    async def run(*args, **kwargs):
+        with scan_budget():
+            return await function(*args, **kwargs)
+    return run
 
 
 async def _detect(frame_path: Path, local_detector_callable) -> list[dict]:
@@ -79,25 +124,25 @@ async def _detect(frame_path: Path, local_detector_callable) -> list[dict]:
     raw per-frame detection list (possibly empty)."""
     urls = _classifier_urls()
     if urls:
-        url = urls[next(_remote_rr) % len(urls)]
+        def validate(data):
+            detections = data['detections']
+            _validate_remote_detections(detections)
+            return detections
         try:
-            with frame_path.open("rb") as fh:
-                resp = await _remote_http_client().post(
-                    f"{url}/detect", files={"frame": (frame_path.name, fh, "image/jpeg")}
-                )
-            if resp.status_code == 200:
-                detections = resp.json()['detections']
-                _validate_remote_detections(detections)
-                counts = _scan_remote_counts.get()
-                if counts is not None:
-                    counts['ok'] += 1
-                return detections
-            logger.warning("Remote classifier %s returned HTTP %d -- falling back to local", url, resp.status_code)
-        except Exception:
-            logger.warning("Remote classifier %s unreachable -- falling back to local CPU", url, exc_info=True)
+            detections = await _remote_request('/detect', validate,
+                files={'frame': (frame_path.name, frame_path.read_bytes(), 'image/jpeg')})
+            counts = _scan_remote_counts.get()
+            if counts is not None: counts['ok'] += 1
+            return detections
+        except WorkerBudgetExceeded:
+            raise
+        except WorkersUnavailable:
+            pass
     counts = _scan_remote_counts.get()
     if urls and counts is not None:
         counts['fallback'] += 1
+    if urls and budget():
+        return await budget().local(local_detector_callable, str(frame_path))
     return await asyncio.to_thread(local_detector_callable, str(frame_path))
 # --------------------------------------------------------------------------------
 
@@ -264,7 +309,11 @@ async def _extract_frames_continuous(
     except asyncio.CancelledError:
         # Same reasoning as remux.py's _run_with_progress -- cancellation must
         # kill the actual ffmpeg process, not just stop awaiting it.
-        proc.kill()
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass  # Process exited between the state check and kill.
         await proc.wait()
         raise
 
@@ -360,6 +409,7 @@ def _resumable_prefix(
 _SCAN_CHUNK_SECONDS = 300.0
 
 
+@bounded_scan
 async def _scan_frames(
     video_path: Path,
     ffmpeg_bin: str,
@@ -372,6 +422,7 @@ async def _scan_frames(
     resume_scores_path: Path | None = None,
     on_status=None,
     local_gate_owned: bool = False,
+    frame_cache=None,
 ) -> list[FrameScore]:
     """Shared implementation behind scan_video_frames (whole file) and
     scan_window_frames (one short padded clip) -- extract via one continuous
@@ -494,7 +545,9 @@ async def _scan_frames(
             progress_high_water = max(progress_high_water, min(done, expected_total))
             if on_status is not None:
                 fps = completed_overall / max(0.001, time.monotonic() - started)
-                await on_status(f"{phase} · remote {remote_ok + individual_counts['ok']} · fallback {remote_fallback + individual_counts['fallback']} · {fps:.1f} fps · {in_flight} in flight")
+                await on_status(f"{phase} · remote {remote_ok + individual_counts['ok']} · fallback {remote_fallback + individual_counts['fallback']} · {fps:.1f} fps · {in_flight} in flight"
+                    + (f" · quarantined {_pool().blocked_count(_classifier_urls())} · failures {budget().failures} · source routes disabled {len(budget().source_disabled)} · CPU frames {budget().cpu_frames}/{budget().max_cpu_frames}" if _classifier_urls() else '')
+                    + f" · elapsed {time.monotonic()-started:.0f}s")
             if on_progress is not None:
                 await on_progress(progress_high_water, expected_total)
 
@@ -508,31 +561,32 @@ async def _scan_frames(
             in_flight += 1
             await report(f"Extracting chunk {number + 1}/{chunk_count} (remote)")
             try:
-                urls = _classifier_urls()
-                url = urls[next(_remote_rr) % len(urls)]
-                response = await _remote_http_client().post(
-                    url + '/scan', timeout=660,
-                    json={'source_url': source_url(video_path),
-                          'start': effective_start_offset + offset,
-                          'duration': duration, 'interval': frame_interval_seconds},
-                )
-                response.raise_for_status()
-                remote_scores = response.json()['scores']
                 count = max(1, round(duration / frame_interval_seconds))
-                if len(remote_scores) != count:
-                    raise ValueError('Incomplete remote scan')
-                for i, score in enumerate(remote_scores):
-                    expected = effective_start_offset + offset + i * frame_interval_seconds
-                    if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
-                        raise ValueError('Invalid remote score')
-                    if _selected_detection_labels.get() is not None and score.get('schema_version') != 2:
-                        raise ValueError('Selected labels require raw detector evidence')
-                    if score.get('schema_version') == 2:
-                        _validate_remote_detections(score.get('detections'))
+                def validate(data):
+                    remote_scores = data['scores']
+                    if not isinstance(remote_scores,list) or len(remote_scores) != count:
+                        raise ValueError('Incomplete remote scan')
+                    for i, score in enumerate(remote_scores):
+                        expected = effective_start_offset + offset + i * frame_interval_seconds
+                        if not math.isfinite(float(score['t'])) or abs(float(score['t']) - expected) > 1e-5 or not 0 <= float(score['c']) <= 1:
+                            raise ValueError('Invalid remote score')
+                        if _selected_detection_labels.get() is not None and score.get('schema_version') != 2:
+                            raise ValueError('Selected labels require raw detector evidence')
+                        if score.get('schema_version') == 2:
+                            _validate_remote_detections(score.get('detections'))
+                    if frame_cache and 'sample_protocol' in data:
+                        frame_cache.accept_remote(data, remote_scores)
+                    return remote_scores
+                remote_scores = await _remote_request('/scan', validate, timeout=90,
+                    json={'source_url': source_url(video_path), 'start': effective_start_offset + offset,
+                          'duration': duration, 'interval': frame_interval_seconds,
+                          **({'include_samples':True} if frame_cache else {})})
                 remote_ok += count
                 extraction_parts[number] = duration
                 extracted_fraction = sum(extraction_parts.values()) / remaining_duration
                 return None, remote_scores
+            except WorkerBudgetExceeded:
+                raise
             except Exception:
                 # Do not log exception text: httpx errors contain the
                 # request URL, and source capabilities are credentials.
@@ -552,11 +606,15 @@ async def _scan_frames(
 
         async def extract():
             async with local_decode_slot:
-                await _extract_frames_continuous(
+                work = _extract_frames_continuous(
                     ffmpeg_bin, video_path, frame_interval_seconds, Path(tmp.name), duration,
                     on_extract_progress=extraction_progress,
                     start_offset=effective_start_offset + offset, clip_duration=duration,
                 )
+                if _classifier_urls():
+                    await asyncio.wait_for(work,timeout=max(120,min(1800,duration*2)))
+                else:
+                    await work  # Intentional CPU-only mode retains its normal path.
         if remote_extract_enabled() and not local_gate_owned:
             # Output verification already runs under the parent's heavy gate.
             # Reacquiring it from this child extraction task would deadlock.
@@ -571,8 +629,8 @@ async def _scan_frames(
         return tmp, effective_start_offset + offset
 
     async def produce():
-        # Two requests may overlap on the GPU box, where a decode lock lets
-        # extraction N+1 overlap inference N without parallel source decodes.
+        # Two requests may overlap across independent workers. Client admission
+        # serializes each URL; new workers additionally guard their CUDA session.
         # Results are delivered in source order; cancellation joins *all*
         # pending work before any tempdir is removed.
         pending = []
@@ -605,25 +663,21 @@ async def _scan_frames(
             in_flight += 1
             try:
                 results = None
-                urls = _classifier_urls()
-                if urls:
+                if _classifier_urls():
+                    def validate(data):
+                        values = data['detections']
+                        if not isinstance(values,list) or len(values)!=len(items):
+                            raise ValueError('Incomplete batch response')
+                        for result in values: _validate_remote_detections(result)
+                        return values
                     try:
-                        url = urls[next(_remote_rr) % len(urls)]
-                        response = await _remote_http_client().post(
-                            f"{url}/detect-batch",
-                            files=[('frames', (p.name, p.read_bytes(), 'image/jpeg')) for _, p in items],
-                        )
-                        response.raise_for_status()
-                        results = response.json()['detections']
-                        if not isinstance(results, list) or len(results) != len(items) or any(not isinstance(r, list) for r in results):
-                            raise ValueError('incomplete batch response')
-                        # Validate before trusting any part of the response.
-                        for result in results:
-                            _validate_remote_detections(result)
+                        results = await _remote_request('/detect-batch', validate,
+                            files=[('frames',(p.name,p.read_bytes(),'image/jpeg')) for _,p in items])
                         remote_ok += len(items)
-                    except Exception:
-                        logger.warning('Batch classifier failed; retrying individual frames', exc_info=True)
-                        results = None
+                    except WorkerBudgetExceeded:
+                        raise
+                    except WorkersUnavailable:
+                        pass
                 for position, (index, path) in enumerate(items):
                     ts = chunk_abs_start + index * frame_interval_seconds
                     try:
@@ -638,8 +692,10 @@ async def _scan_frames(
                             if resume_scores_path is not None:
                                 with resume_scores_path.open('a') as fh:
                                     fh.write(json.dumps({'schema_version': 2, 't': ts, 'c': score.confidence, 'detections': score.detections}) + '\n')
+                    except WorkerBudgetExceeded:
+                        raise
                     except Exception:
-                        logger.warning('Scene frame failed at %.2fs', ts, exc_info=True)
+                        raise RuntimeError('Classifier frame analysis failed; no partial scan activated') from None
                     completed_overall += 1
                     await report(f"Classifying {already_done_units + completed_overall}/{expected_total} frames")
             finally:
@@ -653,9 +709,10 @@ async def _scan_frames(
             item = await prepared.get()
             if item is None:
                 break
+            if isinstance(item, WorkerBudgetExceeded):
+                raise item
             if isinstance(item, Exception):
-                logger.warning('Chunk extraction failed: %s', item)
-                break
+                raise RuntimeError('Classifier extraction failed; no partial scan activated') from None
             tmp, chunk_abs_start = item
             if tmp is None:
                 for raw in chunk_abs_start:
@@ -674,9 +731,17 @@ async def _scan_frames(
                 slots.release()
                 continue
             frames = list(enumerate(sorted(Path(tmp.name).glob('frame_*.jpg'))))
+            if frame_cache:
+                for i,p in frames:
+                    frame_cache.add_file(chunk_abs_start+i*frame_interval_seconds,p)
             batch_size = 12 if _classifier_urls() else 1
-            await asyncio.gather(*(classify_batch(frames[i:i + batch_size], chunk_abs_start)
-                                   for i in range(0, len(frames), batch_size)))
+            tasks = [asyncio.create_task(classify_batch(frames[i:i+batch_size],chunk_abs_start))
+                     for i in range(0,len(frames),batch_size)]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks: task.cancel()
+                await asyncio.gather(*tasks,return_exceptions=True)
             tmp.cleanup()
             owned_dirs.remove(tmp)
             slots.release()
@@ -692,14 +757,14 @@ async def _scan_frames(
 async def scan_video_frames(
     video_path: Path, ffmpeg_bin: str, duration_seconds: float,
     frame_interval_seconds: float, on_progress=None, concurrency: int = 1,
-    resume_scores_path: Path | None = None, on_status=None, local_gate_owned: bool = False, start_offset: float = 0.0,
+    resume_scores_path: Path | None = None, on_status=None, local_gate_owned: bool = False, start_offset: float = 0.0, frame_cache=None,
 ) -> list[FrameScore]:
     """Sample the whole title, preserving the contiguous resume prefix."""
     return await _scan_frames(
         video_path, ffmpeg_bin, frame_interval_seconds, duration_seconds,
         on_progress=on_progress, concurrency=concurrency,
         resume_scores_path=resume_scores_path, on_status=on_status, local_gate_owned=local_gate_owned,
-        start_offset=start_offset, clip_duration=duration_seconds if start_offset else None,
+        start_offset=start_offset, clip_duration=duration_seconds if start_offset else None, frame_cache=frame_cache,
     )
 
 

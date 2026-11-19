@@ -10,6 +10,8 @@ The model (~70MB) is downloaded to /models on first use and cached there.
 """
 
 import tempfile
+import base64
+from remote_worker.inference import InferenceGuard, InferenceUnavailable
 import asyncio
 import math
 import subprocess
@@ -40,6 +42,7 @@ app.add_event_handler('shutdown', shutdown_renders)
 # NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES in compose.
 _cache: dict[str, NudeDetector] = {}
 _load_lock = threading.Lock()
+_inference = InferenceGuard()
 _stats = {"requests_served": 0, "frames_served": 0, "total_latency_seconds": 0.0, "in_flight": 0}
 
 
@@ -74,7 +77,27 @@ def detector() -> NudeDetector:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, **await stats()}
+    return {"ok": not _inference.quarantined, **await stats()}
+
+
+@app.post('/ready')
+async def ready():
+    """Explicit bounded smoke inference, never run by a reachability GET."""
+    def smoke():
+        import struct
+        with tempfile.TemporaryDirectory() as folder:
+            # Standard-library black 64x64 24-bit BMP (192-byte aligned rows).
+            # No image-library/model import is needed to create the probe.
+            path = Path(folder)/'smoke.bmp'
+            pixels=bytes(64*64*3)
+            path.write_bytes(b'BM'+struct.pack('<IHHI',54+len(pixels),0,0,54)
+                +struct.pack('<IiiHHIIiiII',40,64,64,1,24,0,len(pixels),0,0,0,0)+pixels)
+            return _inference.run(detector, path)
+    try:
+        await run_in_threadpool(smoke)
+    except InferenceUnavailable:
+        raise HTTPException(503, 'Classifier inference is not ready') from None
+    return _inference.status()
 
 
 @app.post("/detect")
@@ -92,18 +115,19 @@ async def detect(frame: UploadFile = File(...)) -> dict:
 
 
 async def _detect_upload(frame: UploadFile) -> dict:
-    data = await frame.read()
-    if not data:
-        return {"detections": []}
+    data = await frame.read(4*1024*1024+1)
+    if not data or len(data)>4*1024*1024:
+        raise HTTPException(422, 'Expected a bounded non-empty image')
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp.write(data)
         tmp_path = str(Path(tmp.name))
     try:
-        # Inference is synchronous and can take tens of ms -- run it in the
-        # threadpool so concurrent requests don't serialize on (and time out
-        # behind) the event loop. ONNX Runtime sessions are thread-safe for
-        # concurrent .run() calls.
-        detections = await run_in_threadpool(lambda: detector().detect(tmp_path))
+        # Keep blocking inference off the event loop, but serialize access to
+        # the shared CUDA session across /scan, /detect and /detect-batch.
+        try:
+            detections = await run_in_threadpool(_inference.run, detector, tmp_path)
+        except InferenceUnavailable:
+            raise HTTPException(503, 'Classifier inference unavailable') from None
     finally:
         Path(tmp_path).unlink(missing_ok=True)
     return {"detections": detections or []}
@@ -185,6 +209,7 @@ class ScanRequest(BaseModel):
     start: float = Field(ge=0, allow_inf_nan=False)
     duration: float = Field(gt=0, le=300, allow_inf_nan=False)
     interval: float = Field(gt=0, allow_inf_nan=False)
+    include_samples: bool = False
 
 
 # Two bounded requests permit decode N+1 to overlap ONNX inference N. Only
@@ -196,7 +221,7 @@ _EXPLICIT = {'FEMALE_BREAST_EXPOSED', 'FEMALE_GENITALIA_EXPOSED',
              'BUTTOCKS_EXPOSED', 'ANUS_EXPOSED'}
 
 
-def _scan_chunk(params: ScanRequest) -> list[dict]:
+def _scan_chunk(params: ScanRequest) -> list[dict] | tuple[list[dict], list[dict]]:
     """Decode once per bounded chunk; retry CUDA decode on CPU from scratch.
 
     Do not return a partial extraction after hardware decode failed: it could
@@ -220,7 +245,7 @@ def _scan_chunk(params: ScanRequest) -> list[dict]:
                         '-i', params.source_url, '-t', str(params.duration),
                         '-vf', f'fps=1/{params.interval},format=yuvj420p',
                         '-q:v', '4', str(directory / 'frame_%08d.jpg')]
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
                 if result.returncode == 0:
                     break
             else:
@@ -231,32 +256,56 @@ def _scan_chunk(params: ScanRequest) -> list[dict]:
         expected = max(1, round(params.duration / params.interval))
         if len(frames) != expected:
             raise RuntimeError('Incomplete decoded chunk')
-        det = detector()
         scores = []
         for i, frame in enumerate(frames):
-            detections = det.detect(str(frame)) or []
+            detections = _inference.run(detector, frame)
             scores.append({'schema_version': 2, 't': params.start + i * params.interval,
                 'c': max((d['score'] for d in detections if d.get('class') in _EXPLICIT), default=0.0),
                 'detections': detections})
-        return scores
+        samples = []
+        if params.include_samples:
+            import cv2
+            for i,frame in enumerate(frames):
+                t = params.start+i*params.interval
+                if abs(t-(round(t-.5)+.5))>1e-5:
+                    continue
+                image=cv2.imread(str(frame))
+                if image is None:raise ValueError('Shared snapshot decode failed')
+                height,width=image.shape[:2]
+                scale=min(1.,1024/max(height,width))
+                if scale<1:
+                    image=cv2.resize(image,(max(1,round(width*scale)),max(1,round(height*scale))),interpolation=cv2.INTER_AREA)
+                ok,data=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,85])
+                if not ok:raise ValueError('Shared snapshot encode failed')
+                samples.append({'t':t,'jpeg':base64.b64encode(data.tobytes()).decode()})
+        return (scores,samples) if params.include_samples else scores
 
 
 @app.post('/scan')
 async def scan(params: ScanRequest):
+    if params.include_samples and params.duration>60:
+        raise HTTPException(422,'Shared frame requests are limited to sixty seconds')
     async with _scan_slot:
         started = time.monotonic()
         _stats['in_flight'] += 1
         try:
-            scores = await run_in_threadpool(_scan_chunk, params)
+            if _inference.quarantined:
+                raise InferenceUnavailable('Classifier quarantined')
+            result = await run_in_threadpool(_scan_chunk, params)
+            scores,samples = result if params.include_samples else (result,None)
             _stats['requests_served'] += 1
             _stats['frames_served'] += len(scores)
             _stats['total_latency_seconds'] += time.monotonic() - started
             return {'scores': scores, 'schema_version': 2,
                     'capabilities': ['nudenet.raw_detections'],
-                    'semantic_categories': []}
+                    'semantic_categories': [],
+                    **({'sample_frames':samples,'sample_protocol':'fps-cache-v1'} if samples is not None else {})}
+        except InferenceUnavailable:
+            raise HTTPException(503,'Classifier inference unavailable',headers={'X-Worker-Failure':'inference'}) from None
         except Exception:
-            # Do not echo signed source URLs (including in subprocess errors).
-            raise HTTPException(503, 'Remote extraction failed')
+            # Source/file failures must not quarantine a healthy GPU globally.
+            # Do not echo signed URLs (including through exception chaining).
+            raise HTTPException(503,'Remote extraction failed',headers={'X-Worker-Failure':'source'}) from None
         finally:
             _stats['in_flight'] -= 1
 
@@ -270,6 +319,7 @@ async def stats() -> dict:
     count = _stats['requests_served']
     return {
         **_stats,
+        **_inference.status(),
         **render_stats(),
         'device': ('GPU' if 'CUDAExecutionProvider' in providers else 'CPU') if det else 'not loaded',
         'providers': providers,

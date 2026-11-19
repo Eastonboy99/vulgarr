@@ -3,6 +3,7 @@ together for one title's scene-detection scan. Mirrors app.processing's role for
 the subtitle/mute pipeline, but is a wholly independent feature -- see the
 scene-detection plan for why this doesn't share Title.status/ProcessingJob."""
 
+import asyncio
 import datetime
 import hashlib
 import json
@@ -31,7 +32,9 @@ from app.vision.content_classifier import scan_content_windows, classify_window
 from app.vision import contextual
 from app.vision.claude_verify import verify_candidate
 from app.vision.classifier import scan_video_frames, scan_window_frames, detection_labels
+from app.vision.worker_pool import WorkerBudgetExceeded
 from app.vision.scene_cluster import (
+    FrameScore,
     boundary_touches_window_edge,
     cluster_scenes,
     refine_scene_boundary,
@@ -135,6 +138,8 @@ async def _refine_candidate_boundary(
                 frame_interval_seconds=verify_interval,
                 concurrency=frame_concurrency,
             )
+        except WorkerBudgetExceeded:
+            raise
         except Exception:
             logger.warning(
                 "Scene verification pass failed for %s at %.1f-%.1fs (pad=%.1fs)",
@@ -158,14 +163,58 @@ async def _refine_candidate_boundary(
     return start, end, frac, window_scores
 
 
+async def _refine_protected_boundary(video_path, candidate, scores, duration, threshold, interval, concurrency):
+    """Reuse full-title 4-fps evidence. Densify at most two four-second edges.
+
+    Never shrink an original candidate or repeatedly rescan its interior.
+    Conservative padding remains even when the edge recheck finds no hits.
+    """
+    from app.scenes.protection import BOUNDARY_SECONDS
+    pad=BOUNDARY_SECONDS
+    ranges=[(max(0,candidate.start-pad),min(duration,candidate.start+pad)),
+            (max(0,candidate.end-pad),min(duration,candidate.end+pad))]
+    if ranges[1][0]<=ranges[0][1]:ranges=[(ranges[0][0],ranges[1][1])]
+    samples=[s for s in scores if candidate.start-pad<=s.timestamp<=candidate.end+pad]
+    for start,end in ranges:
+        if end<=start:continue
+        try:
+            samples.extend(await scan_window_frames(video_path,app_settings.ffmpeg_bin,
+                window_start=start,window_end=end,pad_seconds=0,
+                frame_interval_seconds=interval,concurrency=concurrency))
+        except WorkerBudgetExceeded:
+            raise
+        except Exception:
+            # Coarse coverage has already passed. Preserve it and its padding;
+            # a failed optional edge check never creates clear evidence.
+            logger.warning('Bounded edge refinement unavailable; retaining coarse evidence and padding')
+    merged={}
+    for sample in samples:
+        previous=merged.get(sample.timestamp)
+        merged[sample.timestamp]=sample if previous is None else FrameScore(
+            timestamp=sample.timestamp,confidence=max(previous.confidence,sample.confidence),
+            detections=(previous.detections or [])+(sample.detections or []))
+    samples=[merged[t] for t in sorted(merged)]
+    hits=[s.timestamp for s in samples if s.confidence>=threshold]
+    start=max(0,min([candidate.start]+hits)-pad)
+    end=min(duration,max([candidate.end]+hits)+pad)
+    return start,end,verified_fraction(samples,threshold),samples
+
+
 async def scan_for_scenes(session: AsyncSession, title: Title, job_id: int,
                           on_progress: ScanProgressCallback | None = None,
                           on_stage: StageCallback | None = None) -> ScanOutcome:
     """Apply the title scan's exact NudeNet proposal classes without global state."""
     policy = validate_policy(await get_setting(session, "scene_content_policy"))
     selected = [label for label in NUDENET_LABELS if policy["actions"][category_id(label)] != "allow"]
-    with detection_labels(selected):
-        return await _scan_for_scenes(session, title, job_id, on_progress, on_stage, proposal_policy=policy)
+    from app.vision.worker_pool import scan_budget
+    with detection_labels(selected), scan_budget():
+        try:
+            return await _scan_for_scenes(session, title, job_id, on_progress, on_stage, proposal_policy=policy)
+        finally:
+            # Images are disposable/private. Keep resumable JSON evidence on
+            # failures, not hundreds of MB of snapshots per failed title.
+            await asyncio.to_thread(shutil.rmtree,
+                app_settings.data_dir/'scan_work'/str(job_id)/'frames',ignore_errors=True)
 
 
 async def _scan_for_scenes(
@@ -248,6 +297,13 @@ async def _scan_for_scenes(
         return await _scan_semantic(session, title, job_id, scan_work_dir,
                                     fingerprint, duration, on_progress, on_stage, contextual_config)
 
+    frame_cache=None
+    if protected:
+        from app.vision.frame_cache import FrameCache
+        from app.vision.remote_source import remote_extract_enabled
+        frame_cache=FrameCache(scan_work_dir/'frames',fingerprint,video_path,app_settings.ffmpeg_bin,duration,
+            local_gate_owned=not remote_extract_enabled())
+    if on_stage:await on_stage('Full-title anatomy discovery')
     scores = await scan_video_frames(
         video_path,
         app_settings.ffmpeg_bin,
@@ -257,6 +313,7 @@ async def _scan_for_scenes(
         concurrency=frame_concurrency,
         resume_scores_path=resume_scores_path,
         on_status=on_stage,
+        **({'frame_cache':frame_cache} if frame_cache is not None else {}),
     )
 
     if protected:
@@ -284,16 +341,15 @@ async def _scan_for_scenes(
     if candidates and on_stage is not None:
         await on_stage(f"Verifying {len(candidates)} candidate scene(s)")
     for candidate in candidates:
-        start, end, frac, window_scores = await _refine_candidate_boundary(
-            video_path,
-            candidate.start,
-            candidate.end,
-            verify_pad,
-            verify_max_pad,
-            verify_interval,
-            confidence_threshold,
-            frame_concurrency,
-        )
+        if protected:
+            start,end,frac,window_scores=await _refine_protected_boundary(video_path,candidate,scores,duration,
+                confidence_threshold,verify_interval,frame_concurrency)
+            if visual_timeline and end>=duration-1e-6:end=max(end,visual_timeline.container_duration)
+        else:
+            start, end, frac, window_scores = await _refine_candidate_boundary(
+                video_path,candidate.start,candidate.end,verify_pad,verify_max_pad,
+                verify_interval,confidence_threshold,frame_concurrency)
+        if on_stage:await on_stage(f'Candidate boundaries {len(refined)+1}/{len(candidates)}')
         if end - start < min_duration:
             # A single (or tightly clustered) dense hit can refine to a
             # near-zero-width span -- expand symmetrically around its midpoint
@@ -345,7 +401,7 @@ async def _scan_for_scenes(
     if selected != sorted(k for k in NUDENET_CATEGORIES if current_policy["actions"][k] != "allow"):
         raise ValueError("Detection label preferences changed during scanning; run a fresh scan")
     contextual_analysis = await _add_contextual_rows(session, title, job_id, staged_rows, scan_work_dir,
-        fingerprint, duration, contextual_config, on_progress, on_stage, visual_timeline=visual_timeline)
+        fingerprint, duration, contextual_config, on_progress, on_stage, visual_timeline=visual_timeline, frame_cache=frame_cache)
     contextual_analysis.pop("added_rows")
     if protected:
         contextual_analysis["protection"] = {"fingerprint": protection_revision,
@@ -386,7 +442,7 @@ async def _contextual_config(session):
 
 
 async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerprint,
-                               duration, config, on_progress, on_stage, visual_timeline=None):
+                               duration, config, on_progress, on_stage, visual_timeline=None, frame_cache=None):
     """Stage independent proposals without publishing or vetoing NudeNet rows.
 
     Adjacent equivalent windows coalesce. Subtract already-blocking detector
@@ -407,7 +463,8 @@ async def _add_contextual_rows(session, title, job_id, rows, work_dir, fingerpri
         windows, coverage = await protection.analyze_windows(video_path=Path(title.video_path), duration=duration,
             checkpoint_dir=work_dir / "protection", fingerprint=fingerprint, config=config,
             policy=await get_setting(session, "scene_content_policy"), on_progress=_progress_slice(on_progress, .35, .99),
-            frame_timestamp_limit=visual_timeline.last_sample_time if visual_timeline else None)
+            frame_timestamp_limit=visual_timeline.last_sample_time if visual_timeline else None,
+            frame_cache=frame_cache, on_stage=on_stage)
         analysis["protection_coverage"] = coverage
     else:
         windows = await contextual.scan_contextual_windows(video_path=Path(title.video_path), duration=duration,

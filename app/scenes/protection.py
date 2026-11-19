@@ -19,10 +19,12 @@ from app.scenes.content_policy import Action, resolve_action, policy_fingerprint
 from app.vision import contextual
 from app.vision.timeline import probe_visual_timeline
 
-VERSION = "protection-v2"
+VERSION = "protection-v3"
 CONTEXT_WINDOW = 4.0
 DETECTOR_INTERVAL = .25
 BOUNDARY_SECONDS = 2.0
+MAX_UNCERTAINTY_RECHECKS = 64
+MAX_BOUNDARY_CHECKS = 128
 OUTPUT_RETRIES = 1
 KEYS = ("scene_protection_enabled",)
 SCAN_KEYS = ("scene_confidence_threshold", "scene_frame_interval_seconds", "scene_semantic_enabled",
@@ -54,10 +56,13 @@ async def context_config(session):
 
 
 async def fingerprint(session):
+    from app.vision.frame_cache import VERSION as cache_version
     snapshot = {key: await get_setting(session, key) for key in SCAN_KEYS}
     snapshot.update(version=VERSION, enabled=await enabled(session),
                     contextual=contextual.config_fingerprint(await context_config(session)),
                     detector_interval=DETECTOR_INTERVAL, boundary_seconds=BOUNDARY_SECONDS,
+                    max_uncertainty_rechecks=MAX_UNCERTAINTY_RECHECKS,max_boundary_checks=MAX_BOUNDARY_CHECKS,
+                    frame_cache_protocol=cache_version,
                     output_retries=OUTPUT_RETRIES,
                     policy=validate_policy(await get_setting(session, "scene_content_policy")))
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
@@ -109,7 +114,7 @@ async def shot_windows(video_path, duration, ffmpeg_bin, *, local_gate_owned=Fal
     async def decode():
         return await _run([ffmpeg_bin, "-nostdin", "-v", "info", "-i", str(video_path),
             "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "select='gt(scene,0.30)',metadata=print:file=-",
-            "-f", "null", "-"], timeout=max(600, duration * 4))
+            "-f", "null", "-"], timeout=min(1800,max(600,duration / 2)))
     from app.vision.remote_source import remote_extract_enabled
     if remote_extract_enabled() and not local_gate_owned:
         from app.queue.heavy_pipeline_lock import HEAVY_PIPELINE_LOCK
@@ -127,13 +132,16 @@ async def shot_windows(video_path, duration, ffmpeg_bin, *, local_gate_owned=Fal
 
 
 async def analyze_windows(*, video_path, duration, checkpoint_dir, fingerprint, config,
-                          policy, on_progress=None, frame_timestamp_limit=None):
+                          policy, on_progress=None, frame_timestamp_limit=None, frame_cache=None, on_stage=None):
+    if on_stage:await on_stage('Contextual shot discovery (local decode)')
     shots = await shot_windows(video_path, duration, app_settings.ffmpeg_bin)
     common = dict(video_path=video_path, duration=duration, fingerprint=fingerprint,
         base_url=config["scene_contextual_base_url"], api_key=config["scene_contextual_api_key"],
         model=config["scene_contextual_model"], ffmpeg_bin=app_settings.ffmpeg_bin,
         window_seconds=config["scene_contextual_window_seconds"], timeout_seconds=config["scene_contextual_timeout_seconds"],
-        frame_timestamp_limit=frame_timestamp_limit)
+        frame_timestamp_limit=frame_timestamp_limit,
+        **({'frame_cache':frame_cache} if frame_cache is not None else {}))
+    if on_stage:await on_stage('Full-title independent contextual discovery')
     async def discovery_progress(done,total):
         if on_progress and total: await on_progress(.6*done/total,1)
     windows = await contextual.scan_contextual_windows(**common, checkpoint_dir=checkpoint_dir/"discovery",
@@ -142,7 +150,7 @@ async def analyze_windows(*, video_path, duration, checkpoint_dir, fingerprint, 
     resolved, checks = [], 0
     recheck_total = sum(e["uncertain"] for _,_,e in windows)
     for start, end, evidence in windows:
-        if evidence["uncertain"]:
+        if evidence["uncertain"] and checks<MAX_UNCERTAINTY_RECHECKS:
             checked = await contextual.scan_contextual_windows(**common,
                 checkpoint_dir=checkpoint_dir/f"recheck-{start:.6f}-{end:.6f}",
                 window_plan=[(start, end)], max_long_edge=1024, purpose="recheck")
@@ -151,6 +159,7 @@ async def analyze_windows(*, video_path, duration, checkpoint_dir, fingerprint, 
             if not evidence["labels"]:
                 evidence = checked[0][2]
         resolved.append((start, end, evidence))
+    if on_stage:await on_stage(f'Contextual uncertainty checks {checks}; {max(0,recheck_total-checks)} conservatively retained')
     # Expand candidates outward with denser samples. Never narrow an original hit.
     boundaries = set()
     for start, end, evidence in resolved:
@@ -159,14 +168,19 @@ async def analyze_windows(*, video_path, duration, checkpoint_dir, fingerprint, 
             if end < duration: boundaries.add((end, min(duration, end + BOUNDARY_SECONDS)))
     async def boundary_progress(done,total):
         if on_progress and total: await on_progress(.8+.2*done/total,1)
-    if boundaries:
+    boundary_plan=sorted(boundaries)[:MAX_BOUNDARY_CHECKS]
+    if on_stage:await on_stage(f'Contextual boundary checks {len(boundary_plan)}; {len(boundaries)-len(boundary_plan)} retained with original padding')
+    if boundary_plan:
         refined = await contextual.scan_contextual_windows(**common, checkpoint_dir=checkpoint_dir/"boundaries",
-            window_plan=sorted(boundaries), purpose="recheck", on_progress=boundary_progress)
+            window_plan=boundary_plan, purpose="recheck", on_progress=boundary_progress)
         resolved.extend(refined)
     if on_progress: await on_progress(1,1)
     return sorted(resolved, key=lambda w: (w[0], w[1])), {
         "base_windows": math.ceil(duration / common["window_seconds"]), "shot_windows": len(shots),
-        "uncertainty_rechecks": checks, "boundary_checks": len(boundaries), "complete": True}
+        "uncertainty_rechecks": checks, "uncertainty_rechecks_skipped":max(0,recheck_total-checks),
+        "boundary_checks": len(boundary_plan), "boundary_checks_skipped":len(boundaries)-len(boundary_plan),
+        "cache_hits":frame_cache.hits if frame_cache else 0,
+        "cache_fallback_chunks":frame_cache.fallback_chunks if frame_cache else 0, "complete": True}
 
 
 async def readiness(session, title):

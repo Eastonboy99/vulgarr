@@ -7,6 +7,11 @@ Protection-first**. Keep the local LM Studio endpoint/model configured and selec
 clean movie/TV output folders. The application does not change Plex libraries,
 move originals, download models or configure LM Studio's GPU placement.
 
+Current qualification uses **protection-v3**. See
+[bounded worker failures, shared snapshots and compact qualification](SCENE_THROUGHPUT_IMPLEMENTATION.md)
+for the throughput changes and image-rebuild requirements. The compact classifier
+is experimental and cannot publish; full-title rendered-output checks remain.
+
 The setting is off by default so upgrading does not silently approve scenes or
 start expensive processing. Saving it does not enqueue a library-wide rescan.
 For existing titles (including older review-only contextual candidates), start a

@@ -9,19 +9,23 @@ Workers listen on :7861 (GPU 0) and :7862 (GPU 1). Then point vulgarr at them:
 
     SPF_CLASSIFIER_URLS=http://<gpu-host>:7861,http://<gpu-host>:7862
 
-Frames are distributed round-robin across all listed workers. Any worker
-failure (down, timeout, bad response) transparently falls back to local CPU
-classification, so the GPU box being powered off never breaks a scan -- it
-just runs slow again.
+Frames are distributed across healthy workers. Failed workers are quarantined
+for five minutes, with one client request admitted per worker URL. Configured
+remote outages permit only bounded CPU fallback (64 frames / 30 cumulative
+seconds); exhausting that budget withholds the new scene generation and retains
+the prior successful edit, rather than silently spending hours on CPU. A title
+also has a twelve-failed-attempt remote budget. Intentional CPU-only mode, without
+classifier URLs, retains the normal local path. See the
+[throughput controls](../docs/SCENE_THROUGHPUT_IMPLEMENTATION.md).
 
 Notes:
 - The base image carries CUDA 12.4 + cuDNN runtime; requires the NVIDIA
   container toolkit. Without a GPU, onnxruntime falls back to CPU (still
   works as a remote CPU offloader).
-- The `/detect` endpoint runs inference in a threadpool -- ONNX sessions are
-  safe for concurrent `.run()` calls, and this keeps concurrent requests from
-  serializing on the event loop (which showed up as dropped connections when
-  vulgarr's classify concurrency was 8+).
+- Inference stays off the event loop, but a bounded process-wide guard serializes
+  the shared detector across every inference route. Provider/CUDA failures
+  quarantine inference until operator recovery; no automatic restart is done.
+  This is defensive admission, not proof of the original CUDA fault's cause.
 
 ## Chunk extraction on the worker
 
@@ -59,8 +63,11 @@ A missing transport setting leaves the original local-extraction path enabled.
 Local extraction is double-buffered: chunk N+1 decodes while N is classified,
 with at most two temporary chunk directories alive. Remote scans similarly
 prefetch the next bounded request while the previous scores are checkpointed.
-Each worker permits two chunk requests but serializes source decoding: chunk
-N+1 can extract while N runs inference, without two concurrent source decodes.
+The server still permits two chunk requests and serializes source decoding;
+the current client conservatively admits one request per worker URL. Prefetch
+can overlap work on independent GPUs. Shared snapshot requests are limited to
+sixty seconds and reuse the anatomy decode at up to 1024px; older workers use
+a bounded application-side frame-cache decode instead.
 Use one process/container per GPU. Every successful frame is appended separately
 to `scores.jsonl`; resume still trusts only its contiguous prefix, not its maximum
 timestamp. Interrupted or malformed chunks never advance that prefix.
@@ -74,9 +81,13 @@ traffic: the HTTP source still reads the media library on the vulgarr host.
 
 - `POST /detect-batch`: multipart `frames` (1–16 JPEGs), returns
   `{"detections": [[...], [...]]}` in input order. Vulgarr sends batches of 12;
-  failed/malformed batches retry the existing single-frame `/detect` route.
-- `GET /health`: liveness plus process-local statistics. Model loading is lazy;
-  before first inference, the device is reported as `not loaded`.
+  failed/malformed batches try other healthy capacity, then bounded local fallback.
+  A quarantined worker is not hammered with individual-frame retries.
+- `GET /health`: liveness plus process-local statistics; never loads a model.
+  `readiness` distinguishes uninitialized/ready/quarantined inference. HTTP 200
+  alone is not readiness. Before first inference, device is `not loaded`.
+- `POST /ready`: explicit inference smoke test on a generated neutral image.
+  Does not reset a quarantined CUDA context.
 - `GET /stats`: device/providers, successful requests and frames served,
   mean successful-request latency in milliseconds, and current in-flight count.
   Counts reset on worker restart; failures do not count as successful requests.
@@ -88,8 +99,9 @@ traffic: the HTTP source still reads the media library on the vulgarr host.
 
 Fresh databases default to 16 in-flight classification requests when
 `SPF_CLASSIFIER_URLS` is set, otherwise 8. Saved settings are never overwritten:
-existing installations should set **Frame classify concurrency** to 16 in
-Settings if desired. Batch concurrency bounds requests, not individual frames.
+higher saved concurrency never bypasses the per-worker admission guard. Batch
+concurrency bounds requests, not individual frames; it does not qualify a GPU's
+concurrent ONNX inference reliability.
 
 ## Optional NVENC segment encoding
 

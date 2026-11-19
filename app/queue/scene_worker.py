@@ -457,9 +457,10 @@ class SceneJobQueue:
                 job.progress_percent = round(100 * fraction, 1)
                 message = scan_phase
                 if fraction > 0 and not is_final:
-                    elapsed = now - job_start_monotonic
-                    eta_seconds = elapsed * (1 - fraction) / fraction
-                    message += f", {_format_eta(eta_seconds)}"
+                    # Progress combines unlike stages and retries. Extrapolating
+                    # all elapsed time produces misleading multi-hour ETAs.
+                    elapsed = now-job_start_monotonic
+                    message += f" · elapsed {int(elapsed//60)}m (overall ETA unavailable across stages)"
                 job.progress_message = message
                 await session.commit()
 
@@ -503,7 +504,7 @@ class SceneJobQueue:
                     # Retain the latest counters through dense rescans/VLM
                     # stages and in the terminal summary after polling swaps.
                     telemetry = message.split(' · remote ', 1)[1]
-                    scan_counters = ' · remote ' + ' · '.join(telemetry.split(' · ')[:2])
+                    scan_counters = ' · remote ' + ' · '.join(part for part in telemetry.split(' · ') if not part.startswith('elapsed '))
                 scan_phase = message
                 if message.startswith(("Extracting chunk", "Classifying ")):
                     return  # The paired progress callback throttles database writes.

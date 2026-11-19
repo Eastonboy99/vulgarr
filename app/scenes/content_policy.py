@@ -111,7 +111,7 @@ def validate_evidence(value: dict) -> dict:
     recall between sampled frames. Missing labels within coverage mean absent.
     """
     required = {"schema_version", "labels", "coverage", "uncertain", "explanation", "model"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold", "observations", "sample_timestamps"}:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"confidence_threshold", "observations", "sample_timestamps", "sample_sources"}:
         raise ValueError("Invalid evidence fields")
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise ValueError("Unsupported evidence schema")
@@ -132,6 +132,11 @@ def validate_evidence(value: dict) -> dict:
                 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
                 or times != sorted(times)):
             raise ValueError("Invalid backend sample timestamps")
+    if "sample_sources" in value:
+        sources=value["sample_sources"]
+        if (set(value["coverage"])!=CONTEXTUAL_CATEGORIES or not isinstance(sources,list)
+                or len(sources)!=4 or any(s not in ("exact-seek-v1","fps-cache-v1") for s in sources)):
+            raise ValueError("Invalid backend sampling sources")
     if "observations" in value:
         observations = value["observations"]
         states = {"exposed_nudity", "contextual_nudity", "towel_sheet_covered", "swimwear_underwear", "clothed", "ambiguous_bare_skin", "no_people", "uncertain"}

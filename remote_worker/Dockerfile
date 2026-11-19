@@ -21,6 +21,7 @@ RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel \
 
 COPY server.py .
 COPY render.py remote_worker/render.py
+COPY inference.py remote_worker/inference.py
 
 VOLUME ["/models"]
 EXPOSE 7861

@@ -214,8 +214,11 @@ qualification remains a deployment check.
 See [remote_worker/README.md](remote_worker/README.md) for batch inference,
 optional worker-side chunk extraction, token-authenticated media streaming,
 worker status/throughput reporting, and opt-in NVENC blur-segment encoding.
-All remote failures retain a local path; audio and blur keep their heavy-I/O
-mutual exclusion. Remote extraction fallback reacquires that gate locally.
+Classifier failures now quarantine workers and allow only bounded fallback;
+exhaustion retains the previous edit rather than activating a partial scan.
+See [throughput controls and compact qualification](docs/SCENE_THROUGHPUT_IMPLEMENTATION.md).
+Audio and blur keep their heavy-I/O mutual exclusion. Remote extraction fallback
+reacquires that gate locally.
 
 Build/deploy **this fork's image** to use these features; the upstream `:stable`
 image in the production compose example does not include these changes. Set
