@@ -128,6 +128,10 @@ A last successful file is not automatically retracted when preferences change.
 Your separate Plex clean library and source-library access remain your setup.
 
 A full-title contextual pass plus independent output analysis is expensive.
+The [measured throughput study](SCENE_THROUGHPUT_STUDY.md) also found a failed
+CUDA-worker retry cascade dominating one cancelled run. Do not infer library-scale
+readiness from the software/media test counts below; the study includes bounded
+prototype timings and their accuracy limitations, not an enabled faster mode.
 Higher-resolution rechecks and shot detection add work. CPU-only processing can
 take many hours; do not assume real-time processing or qualified GPU throughput.
 

@@ -1,0 +1,877 @@
+{
+  "schema_version": 1,
+  "scope": "bounded performance microbenchmark; not accuracy qualification",
+  "case_names_are_not_ground_truth": true,
+  "model": {
+    "key": "qwen3.5-4b",
+    "quantization": "Q4_K_M",
+    "requested_gpu_offload": "100%",
+    "observed_allocation_gpu": "RTX 3060",
+    "context_length": 8192,
+    "parallelism": 1,
+    "reasoning": "disabled",
+    "weights_downloaded": false,
+    "dedicated_instances_unloaded": true
+  },
+  "audit": {
+    "title_id": 3807,
+    "scene_job_id": 32,
+    "state_before_investigation": "cancelled",
+    "job_started_utc": "2026-11-16T17:27:27.427706Z",
+    "initial_anatomy_checkpoint_finished_utc": "2026-11-16T17:42:11.544042Z",
+    "first_contextual_request_utc": "2026-11-17T02:56:04Z",
+    "last_contextual_checkpoint_utc": "2026-11-17T04:38:16.137776Z",
+    "job_finished_utc": "2026-11-17T04:38:21.746402Z",
+    "completed_windows": 507,
+    "last_completed_window_end_seconds": 1376,
+    "positive_windows": 2,
+    "uncertain_windows": 78,
+    "worker_1_http500_detect_batch": 416,
+    "worker_1_http500_detect": 4602,
+    "worker_1_http503_scan": 17,
+    "cuda_error": "716: misaligned address",
+    "original_cuda_fault_cause": "not established"
+  },
+  "request_count": 38,
+  "summary": [
+    {
+      "variant": "full_768",
+      "windows": 11,
+      "median_request_seconds": 4.609
+    },
+    {
+      "variant": "gate_768",
+      "windows": 5,
+      "median_request_seconds": 1.156
+    },
+    {
+      "variant": "gate_384",
+      "windows": 11,
+      "median_request_seconds": 0.609
+    },
+    {
+      "variant": "gate_sheet768",
+      "windows": 11,
+      "median_request_seconds": 0.531
+    }
+  ],
+  "screening_prompt": "Screen the four ordered frames for possible exposed or implied nudity. Return candidate if any frame shows exposed breasts/genitals/buttocks or a person appearing unclothed with anatomy hidden by bedding, another body, pose or camera framing. If bare skin or coverage is ambiguous, return uncertain. Clearly clothed people, swimwear/underwear or a securely worn towel are not by themselves implied nudity. Do not infer nudity from romance alone or from faces/hands. Return clear ONLY if all four frames have clear non-nude explanations. No reasoning or prose: return only the required JSON decision.",
+  "normal_controls": "selected by previous model labels and checked by detailed current model; not independently human-annotated",
+  "image_payloads_included": false,
+  "full_title_scan_started": false,
+  "live_settings_changed": false,
+  "extraction_probes": [
+    {
+      "mode": "four independent seeks",
+      "images": 4,
+      "wall_seconds": 2.885
+    },
+    {
+      "mode": "one eight-second decode, two-second sampling",
+      "images": 4,
+      "wall_seconds": 2.1322
+    },
+    {
+      "mode": "one sixty-second decode, one-second sampling",
+      "images": 60,
+      "wall_seconds": 6.8466,
+      "jpeg_bytes": 817666
+    }
+  ],
+  "observations": [
+    {
+      "dataset": "challenging_pilot",
+      "variant": "full_768",
+      "case": "early_control",
+      "seconds": 5.875,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 264,
+        "total_tokens": 1637,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        0.041,
+        2.043,
+        4.045,
+        6.047
+      ],
+      "states": [
+        "towel_sheet_covered",
+        "contextual_nudity",
+        "towel_sheet_covered",
+        "contextual_nudity"
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "full_768",
+      "case": "prior_towel_control",
+      "seconds": 4.609,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 261,
+        "total_tokens": 1634,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        12.053,
+        14.055,
+        16.057,
+        18.059
+      ],
+      "states": [
+        "towel_sheet_covered",
+        "towel_sheet_covered",
+        "no_people",
+        "towel_sheet_covered"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "full_768",
+      "case": "known_context_example",
+      "seconds": 4.89,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 282,
+        "total_tokens": 1655,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        24.065,
+        26.067,
+        28.069,
+        30.071
+      ],
+      "states": [
+        "contextual_nudity",
+        "contextual_nudity",
+        "towel_sheet_covered",
+        "contextual_nudity"
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "full_768",
+      "case": "later_context",
+      "seconds": 4.64,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 267,
+        "total_tokens": 1640,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        32.073,
+        34.075,
+        36.077,
+        38.079
+      ],
+      "states": [
+        "ambiguous_bare_skin",
+        "towel_sheet_covered",
+        "ambiguous_bare_skin",
+        "ambiguous_bare_skin"
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "full_768",
+      "case": "late_mixed_control",
+      "seconds": 4.641,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 265,
+        "total_tokens": 1638,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        48.089,
+        50.091,
+        52.093,
+        54.095
+      ],
+      "states": [
+        "no_people",
+        "no_people",
+        "contextual_nudity",
+        "ambiguous_bare_skin"
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_768",
+      "case": "early_control",
+      "seconds": 1.156,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1105,
+        "completion_tokens": 13,
+        "total_tokens": 1118,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        0.041,
+        2.043,
+        4.045,
+        6.047
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_768",
+      "case": "prior_towel_control",
+      "seconds": 1.157,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1105,
+        "completion_tokens": 13,
+        "total_tokens": 1118,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        12.053,
+        14.055,
+        16.057,
+        18.059
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_768",
+      "case": "known_context_example",
+      "seconds": 1.141,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1105,
+        "completion_tokens": 13,
+        "total_tokens": 1118,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        24.065,
+        26.067,
+        28.069,
+        30.071
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_768",
+      "case": "later_context",
+      "seconds": 1.172,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1105,
+        "completion_tokens": 13,
+        "total_tokens": 1118,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        32.073,
+        34.075,
+        36.077,
+        38.079
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_768",
+      "case": "late_mixed_control",
+      "seconds": 1.125,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 1105,
+        "completion_tokens": 12,
+        "total_tokens": 1117,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        48.089,
+        50.091,
+        52.093,
+        54.095
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_384",
+      "case": "early_control",
+      "seconds": 0.594,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 13,
+        "total_tokens": 398,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        0.041,
+        2.043,
+        4.045,
+        6.047
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_384",
+      "case": "prior_towel_control",
+      "seconds": 0.641,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 13,
+        "total_tokens": 398,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        12.053,
+        14.055,
+        16.057,
+        18.059
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_384",
+      "case": "known_context_example",
+      "seconds": 0.609,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        24.065,
+        26.067,
+        28.069,
+        30.071
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_384",
+      "case": "later_context",
+      "seconds": 0.625,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        32.073,
+        34.075,
+        36.077,
+        38.079
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_384",
+      "case": "late_mixed_control",
+      "seconds": 0.61,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        48.089,
+        50.091,
+        52.093,
+        54.095
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_sheet768",
+      "case": "early_control",
+      "seconds": 0.515,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 13,
+        "total_tokens": 409,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        0.041,
+        2.043,
+        4.045,
+        6.047
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_sheet768",
+      "case": "prior_towel_control",
+      "seconds": 0.547,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 13,
+        "total_tokens": 409,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        12.053,
+        14.055,
+        16.057,
+        18.059
+      ],
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_sheet768",
+      "case": "known_context_example",
+      "seconds": 0.5,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        24.065,
+        26.067,
+        28.069,
+        30.071
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_sheet768",
+      "case": "later_context",
+      "seconds": 0.547,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        32.073,
+        34.075,
+        36.077,
+        38.079
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "challenging_pilot",
+      "variant": "gate_sheet768",
+      "case": "late_mixed_control",
+      "seconds": 0.531,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "clip_times": [
+        48.089,
+        50.091,
+        52.093,
+        54.095
+      ],
+      "decision": "candidate"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "no_people_1",
+      "reference_index": 1,
+      "seconds": 4.625,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 245,
+        "total_tokens": 1618,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "no_people",
+        "no_people",
+        "no_people",
+        "no_people"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "no_people_2",
+      "reference_index": 57,
+      "seconds": 3.656,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 196,
+        "total_tokens": 1569,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "no_people",
+        "no_people",
+        "no_people",
+        "no_people"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "clothed_1",
+      "reference_index": 7,
+      "seconds": 4.187,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 241,
+        "total_tokens": 1614,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "clothed",
+        "clothed",
+        "clothed",
+        "clothed"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "clothed_2",
+      "reference_index": 60,
+      "seconds": 4.235,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 239,
+        "total_tokens": 1612,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "clothed",
+        "clothed",
+        "clothed",
+        "clothed"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "mixed_clear_1",
+      "reference_index": 6,
+      "seconds": 4.172,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 234,
+        "total_tokens": 1607,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "clothed",
+        "no_people",
+        "clothed",
+        "clothed"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "full_768",
+      "case": "mixed_clear_2",
+      "reference_index": 82,
+      "seconds": 4.125,
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 237,
+        "total_tokens": 1610,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "states": [
+        "clothed",
+        "clothed",
+        "clothed",
+        "no_people"
+      ],
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "no_people_1",
+      "reference_index": 1,
+      "seconds": 0.562,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "no_people_2",
+      "reference_index": 57,
+      "seconds": 0.578,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "clothed_1",
+      "reference_index": 7,
+      "seconds": 0.609,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 13,
+        "total_tokens": 398,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "clothed_2",
+      "reference_index": 60,
+      "seconds": 0.578,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "mixed_clear_1",
+      "reference_index": 6,
+      "seconds": 0.625,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "candidate"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_384",
+      "case": "mixed_clear_2",
+      "reference_index": 82,
+      "seconds": 0.579,
+      "usage": {
+        "prompt_tokens": 385,
+        "completion_tokens": 12,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "no_people_1",
+      "reference_index": 1,
+      "seconds": 0.453,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "no_people_2",
+      "reference_index": 57,
+      "seconds": 0.547,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "clothed_1",
+      "reference_index": 7,
+      "seconds": 0.563,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 13,
+        "total_tokens": 409,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "clothed_2",
+      "reference_index": 60,
+      "seconds": 0.484,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "mixed_clear_1",
+      "reference_index": 6,
+      "seconds": 0.484,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 13,
+        "total_tokens": 409,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "uncertain"
+    },
+    {
+      "dataset": "previously_clear_controls",
+      "variant": "gate_sheet768",
+      "case": "mixed_clear_2",
+      "reference_index": 82,
+      "seconds": 0.531,
+      "usage": {
+        "prompt_tokens": 396,
+        "completion_tokens": 12,
+        "total_tokens": 408,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "decision": "clear"
+    }
+  ]
+}
